@@ -187,11 +187,22 @@ RUN set -eux; \
     if [ "$(cat /tmp/llvm_upstream)" = "1" ]; then \
         apt-get update; \
         apt-get install -y --no-install-recommends software-properties-common; \
-        curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh; \
-        chmod +x /tmp/llvm.sh; \
-        if ! /tmp/llvm.sh "${LLVM_VERSION}" all; then \
-            echo "note: apt.llvm.org has no LLVM ${LLVM_VERSION} for this codename;" >&2; \
-            echo "      falling back to the Ubuntu archive Clang." >&2; \
+        # The fallback below must cover the DOWNLOAD as well as the script. It
+        # covered only the script, so an unreachable apt.llvm.org made curl exit
+        # 7 and `set -e` killed the build before the fallback was reached -- a
+        # third-party host being briefly down failed an image build, which is
+        # exactly what the fallback existed to prevent.
+        #
+        # Retries first, because most of these failures are transient.
+        if ! curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+                  --connect-timeout 15 --max-time 120 \
+                  https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh \
+           || ! chmod +x /tmp/llvm.sh \
+           || ! /tmp/llvm.sh "${LLVM_VERSION}" all; then \
+            echo "note: could not install LLVM ${LLVM_VERSION} from apt.llvm.org." >&2; \
+            echo "      Either the host was unreachable or it has no packages for" >&2; \
+            echo "      this codename. Falling back to the Ubuntu archive Clang," >&2; \
+            echo "      which is a working image with an older Clang, not a failure." >&2; \
             apt-get update; \
             apt-get install -y --no-install-recommends \
                 clang clang-tools clang-tidy clang-format clangd \
@@ -311,7 +322,8 @@ RUN set -eux; \
 # image: the toolchain and the agent are both pinned by the image tag.
 RUN set -eux; \
     install -d -m 0755 /etc/apt/keyrings; \
-    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 15 \
+        https://downloads.claude.ai/keys/claude-code.asc \
         -o /etc/apt/keyrings/claude-code.asc; \
     gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc \
         | grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'; \

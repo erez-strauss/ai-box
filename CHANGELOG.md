@@ -4,6 +4,37 @@ All notable changes to ai-box. Versions follow semantic versioning:
 MAJOR for a change that breaks an existing workflow, MINOR for new capability,
 PATCH for fixes that change nothing about how you use it.
 
+## 2.3.11 - 2026-08-29
+
+### Fixed
+
+- **An unreachable apt.llvm.org failed the Ubuntu build** with `exit code: 7`, which is
+  curl's "failed to connect". The fallback added in 2.2.0 was meant to prevent exactly
+  this, and covered only the case where `llvm.sh` ran and returned non-zero: the
+  *download* was a bare `curl` under `set -e`, so a connection failure ended the build
+  before the fallback could be reached.
+
+  The download, the `chmod` and the script are now all inside one condition, so any
+  failure along the upstream path takes the archive Clang instead. Verified in all three
+  states: connection refused, script failing, and everything working.
+
+- **Network fetches retry.** `curl` gets `--retry 3 --retry-delay 2 --retry-all-errors`
+  and connection timeouts, for the LLVM script and for the Claude Code signing key on all
+  three images. Most of these failures are transient, and a retry is cheaper than a failed
+  build. The key fetch still verifies the fingerprint and still fails hard on a mismatch:
+  retrying a transient network error is not the same as tolerating a bad signature.
+
+- The fallback message now distinguishes "the host was unreachable" from "it has no
+  packages for this codename", and states plainly that the result is a working image with
+  an older Clang rather than a failure.
+
+### Note
+
+This is the second time a claim of "degrades rather than fails" turned out to cover only
+part of the path it described. The lesson generalises: a fallback is only as wide as the
+condition it is attached to, and writing the note about resilience is not the same as
+testing every way the thing can break.
+
 ## 2.3.10 - 2026-08-29
 
 ### Changed: GitHub Actions

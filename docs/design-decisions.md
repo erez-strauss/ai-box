@@ -99,6 +99,13 @@ is a snapshot of the GCC 16 branch, not a released 16.1. If a project needs a re
 compiler, pin it (`-g 15`) or use the Fedora image, which currently carries a released
 16.1.1. Being explicit about this beats quietly shipping the older one.
 
+**Attempts degrade, they do not fail -- including the network.** The fallback originally
+covered only the case where `llvm.sh` ran and failed. An unreachable apt.llvm.org made
+`curl` exit 7 and `set -e` ended the build first, so a third-party host being briefly down
+failed an image build. Downloads are retried and every step of the upstream path is inside
+the fallback. A build that cannot reach a third-party host produces a working image with
+the distribution's Clang, and says so.
+
 **Attempts degrade, they do not fail.** If apt.llvm.org has no packages for a codename
 yet, the build falls back to the archive Clang and says so, rather than failing. An image
 that cannot get the newest is still a working image.

@@ -243,7 +243,8 @@ RUN set -eux; \
 
 # ---- Claude Code from the signed dnf repository ----------------------------
 RUN set -eux; \
-    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /tmp/claude-code.asc; \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors --connect-timeout 15 \
+        https://downloads.claude.ai/keys/claude-code.asc -o /tmp/claude-code.asc; \
     gpg --show-keys --with-colons /tmp/claude-code.asc \
         | grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'; \
     rpmkeys --import /tmp/claude-code.asc; \
