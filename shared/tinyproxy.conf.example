@@ -1,0 +1,44 @@
+# Minimal egress allowlist for a ai-box sidecar proxy (see docs, section 8).
+# docker run -d --name ai-proxy --network ai-net \
+#   -v $PWD/shared/tinyproxy.conf.example:/etc/tinyproxy/tinyproxy.conf:ro vimagick/tinyproxy
+Port 8888
+Listen 0.0.0.0
+Timeout 600
+MaxClients 50
+LogLevel Info
+DisableViaHeader Yes
+
+# CONNECT is required for HTTPS; only 443 is permitted.
+ConnectPort 443
+
+# Default-deny: only these destinations resolve.
+Filter "/etc/tinyproxy/filter"
+FilterDefaultDeny Yes
+FilterExtended On
+FilterURLs Off
+
+# Contents for /etc/tinyproxy/filter (one regex per line):
+#   ^api\.anthropic\.com$
+#   ^claude\.ai$
+#   ^claude\.com$
+#   ^platform\.claude\.com$
+#   ^downloads\.claude\.ai$
+#   ^mcp-proxy\.anthropic\.com$
+#   ^storage\.googleapis\.com$
+#   ^raw\.githubusercontent\.com$
+#   ^github\.com$
+#   ^codeload\.github\.com$
+#   ^registry\.npmjs\.org$
+#   ^pypi\.org$
+#   ^files\.pythonhosted\.org$
+#   ^(static\.)?crates\.io$
+#
+# Only needed when the image was built with the matching --agents:
+#   ^api\.x\.ai$                        (grok)
+#   ^generativelanguage\.googleapis\.com$  (gemini)
+#   ^oauth2\.googleapis\.com$             (gemini, auth)
+#   ^api\.openai\.com$                  (codex)
+#   ^chatgpt\.com$                       (codex, auth)
+#
+# An allowlist that omits these produces a box where the extra agents fail with
+# opaque network errors rather than a clear refusal.

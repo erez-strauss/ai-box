@@ -1,0 +1,449 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+# Dockerfile.ai-rocky10
+#
+# Rocky Linux 10 + the newest compilers RHEL 10 offers + Claude Code.
+#
+# Why this image exists: Fedora gives you the newest compilers, Ubuntu LTS
+# gives you a common desktop target, and neither resembles a RHEL production
+# host. If what you deploy onto is RHEL or Rocky, build against this one.
+#
+# The compiler story here is different from the other two images, and it is the
+# thing to understand before using it. RHEL 10 pins a conservative system GCC
+# for the life of the release, and ships newer compilers as *Software
+# Collections* under /opt/rh, which normally require `scl enable`. That does not
+# suit a container: it would mean every command needed a wrapper. So this image
+# resolves the toolset at build time and puts its bin/ and lib64/ directly on
+# PATH and LD_LIBRARY_PATH, which is what `scl enable` does anyway. `gcc` is
+# then the toolset's GCC, with no ceremony.
+#
+# Toolset availability moves between minor releases, so the version is probed
+# rather than assumed: GCC_TOOLSET/LLVM_TOOLSET default to "latest", and the
+# build picks the highest that dnf can actually resolve. This follows the
+# project's rule of feature-probing over version-guessing -- a hardcoded
+# gcc-toolset-15 would break the day Rocky ships 16.
+#
+# Build:
+#   scripts/build.sh rocky
+# ============================================================================
+ARG OS_TAG=10
+ARG BASE_IMAGE=rockylinux/rockylinux:${OS_TAG}
+FROM ${BASE_IMAGE}
+
+# Re-declared after FROM: ARGs used before FROM are otherwise out of scope
+# inside the build stage, and the LABELs below would expand to empty strings.
+ARG OS_TAG
+
+ARG UID=1000
+ARG GID=1000
+ARG USERNAME=dev
+
+# OS_UPDATES=1 (default) applies every pending distro update before installing
+# anything. OS_UPDATES=0 takes the packages exactly as the base image tag
+# shipped them, for a reproducible rebuild. UPDATE_STAMP busts the layer cache
+# for the upgrade step so "updates by default" keeps meaning something.
+ARG OS_UPDATES=1
+ARG UPDATE_STAMP=static
+ARG CLAUDE_CHANNEL=stable
+ARG CLAUDE_VERSION=
+ARG PACKAGE_VERSION=dev
+# UTC by default; a maintainer's local zone is not a sensible image default.
+ARG TZ=UTC
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=${TZ}
+
+# ---- toolchain -------------------------------------------------------------
+# Toolset versions to try, highest first. "latest" means: install the first one
+# dnf can resolve. Override with --build-arg GCC_TOOLSET=15 to pin.
+ARG GCC_TOOLSET=latest
+ARG LLVM_TOOLSET=latest
+ARG GCC_TOOLSET_CANDIDATES="16 15 14"
+ARG LLVM_TOOLSET_CANDIDATES="21 20 19"
+
+# EPEL carries the convenience packages RHEL itself does not (jq, ripgrep,
+# fd-find, mold). CRB (CodeReady Builder) carries -devel packages that several
+# of them need. Both are standard on Rocky and neither is third-party.
+RUN set -eux; \
+    echo "update-stamp: ${UPDATE_STAMP}"; \
+    if [ "${OS_UPDATES}" = "1" ]; then \
+        dnf -y --setopt=install_weak_deps=False --nodocs upgrade; \
+    fi; \
+    dnf -y --setopt=install_weak_deps=False --nodocs install dnf-plugins-core epel-release; \
+    dnf config-manager --set-enabled crb || dnf config-manager --enable crb || true; \
+    dnf -y --setopt=install_weak_deps=False --nodocs install \
+        gcc gcc-c++ make cmake ninja-build ccache \
+        glibc-static libstdc++-static \
+        gdb valgrind strace ltrace \
+        git openssh-clients \
+        python3 python3-pip python3-devel \
+        pkgconf-pkg-config file which findutils diffutils patch \
+        tar gzip bzip2 xz zip unzip \
+        procps-ng psmisc util-linux hostname iputils \
+        less bash-completion \
+        ca-certificates curl wget gnupg2 \
+        openssl-devel zlib-devel libcurl-devel libuuid-devel; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# GCC and LLVM toolsets, probed rather than assumed.
+RUN set -eux; \
+    pick() { \
+        _prefix="$1"; _pin="$2"; shift 2; \
+        if [ "${_pin}" != latest ]; then echo "${_pin}"; return 0; fi; \
+        for _v in "$@"; do \
+            if dnf -q info "${_prefix}-${_v}-gcc" >/dev/null 2>&1 \
+            || dnf -q info "${_prefix}-${_v}-clang" >/dev/null 2>&1; then \
+                echo "${_v}"; return 0; \
+            fi; \
+        done; \
+        return 1; \
+    }; \
+    GT="$(pick gcc-toolset "${GCC_TOOLSET}" ${GCC_TOOLSET_CANDIDATES})" \
+        || { echo "FATAL: no gcc-toolset among ${GCC_TOOLSET_CANDIDATES}" >&2; exit 1; }; \
+    LT="$(pick llvm-toolset "${LLVM_TOOLSET}" ${LLVM_TOOLSET_CANDIDATES})" || LT=""; \
+    echo "selected: gcc-toolset-${GT}${LT:+, llvm-toolset-${LT}}"; \
+    dnf -y --setopt=install_weak_deps=False --nodocs install \
+        "gcc-toolset-${GT}" "gcc-toolset-${GT}-gcc-c++" "gcc-toolset-${GT}-gdb" \
+        "gcc-toolset-${GT}-annobin-plugin-gcc" || \
+    dnf -y --setopt=install_weak_deps=False --nodocs install \
+        "gcc-toolset-${GT}" "gcc-toolset-${GT}-gcc-c++"; \
+    if [ -n "${LT}" ]; then \
+        dnf -y --setopt=install_weak_deps=False --nodocs --skip-unavailable install \
+            "llvm-toolset-${LT}" "llvm-toolset-${LT}-clang-tools-extra" \
+            "llvm-toolset-${LT}-lld" "llvm-toolset-${LT}-lldb" || true; \
+    fi; \
+    if [ -z "${LT}" ]; then \
+        echo "no llvm-toolset resolvable; trying the base repositories for clang"; \
+        dnf -y --setopt=install_weak_deps=False --nodocs install \
+            clang clang-tools-extra lld llvm \
+        || dnf -y --setopt=install_weak_deps=False --nodocs --skip-unavailable install \
+            clang clang-tools-extra lld lldb llvm libasan libubsan libtsan \
+        || echo "note: no clang available on this release; the image ships GCC only"; \
+    fi; \
+    dnf -y --setopt=install_weak_deps=False --nodocs --skip-unavailable install \
+        libasan libubsan libtsan || true; \
+    printf '%s\n' "${GT}" > /etc/ai-box-gcc-toolset; \
+    printf '%s\n' "${LT}" > /etc/ai-box-llvm-toolset; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# Put the toolsets on PATH permanently, which is what `scl enable` does at
+# runtime. Doing it here means no wrapper around every command, and it is why
+# `gcc` in this image is the toolset's GCC and not RHEL's conservative system
+# one. LD_LIBRARY_PATH matters: the toolset links against its own libstdc++.
+RUN set -eux; \
+    GT="$(cat /etc/ai-box-gcc-toolset)"; \
+    LT="$(cat /etc/ai-box-llvm-toolset)"; \
+    ln -sfn "/opt/rh/gcc-toolset-${GT}/root/usr" /opt/rh/toolset; \
+    if [ -n "${LT}" ] && [ -d "/opt/rh/llvm-toolset-${LT}/root/usr" ]; then \
+        ln -sfn "/opt/rh/llvm-toolset-${LT}/root/usr" /opt/rh/toolset-llvm; \
+    else \
+        install -d /opt/rh/toolset-llvm/bin; \
+    fi; \
+    test -x /opt/rh/toolset/bin/gcc; \
+    "/opt/rh/toolset/bin/gcc" --version | head -1
+
+# Optional extras, same required/optional split as the other images.
+RUN set -eux; \
+    OPTIONAL="mold jq ripgrep fd-find tree vim-minimal git-lfs \
+              boost-devel fmt-devel gtest-devel gmock-devel perf \
+              catch2-devel google-benchmark-devel \
+              ShellCheck cppcheck lcov gcovr elfutils elfutils-devel \
+              json-devel eigen3-devel doxygen graphviz \
+              binutils patchelf"; \
+    dnf -y --setopt=install_weak_deps=False --nodocs --skip-unavailable install ${OPTIONAL} \
+        || for p in ${OPTIONAL}; do \
+               dnf -y --setopt=install_weak_deps=False --nodocs install "$p" \
+                   || echo "optional package unavailable, skipped: $p"; \
+           done; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# ---- Python development environment ----------------------------------------
+# Kept identical to the Ubuntu image on purpose (hard rule 10): same path, same
+# ARG names, same tools. Fedora 44 also enforces PEP 668, so `pip install` into
+# the system interpreter is refused. Rather than fight that with
+# --break-system-packages, the image provides a first-class virtualenv at
+# /opt/venv that is first on PATH ahead of /usr/bin and owned by the
+# unprivileged user, so `pip install` inside a session just works without root.
+# Anything installed there is ephemeral, which is what keeps the image
+# reproducible: a permanent addition belongs in PYTHON_TOOLS, not in a session.
+#
+# uv is included because it is the quickest route to a *different* Python than
+# the distro's: `uv venv --python 3.13` in a session, or UV_PYTHON at build time
+# to bake a standalone interpreter into the image.
+ARG PYTHON_TOOLS="uv ruff mypy pytest pytest-cov ipython build wheel jinja2 numpy pandas"
+ARG UV_PYTHON=
+
+ENV VIRTUAL_ENV=/opt/venv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+# PYTHON_TOOLS is deliberately unquoted: it is a package list and must word-split.
+# hadolint ignore=SC2086
+RUN set -eux; \
+    python3 -m venv "${VIRTUAL_ENV}"; \
+    "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel; \
+    "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir ${PYTHON_TOOLS}; \
+    if [ -n "${UV_PYTHON}" ]; then \
+        install -d "${UV_PYTHON_INSTALL_DIR}"; \
+        "${VIRTUAL_ENV}/bin/uv" python install "${UV_PYTHON}"; \
+    fi; \
+    "${VIRTUAL_ENV}/bin/python" --version; \
+    "${VIRTUAL_ENV}/bin/ruff" --version; \
+    "${VIRTUAL_ENV}/bin/python" -c 'import numpy, pandas, jinja2; \
+print("numpy", numpy.__version__, "pandas", pandas.__version__, "jinja2", jinja2.__version__)' 
+
+# Fail now, not at first use, if a package installed but produced no binary.
+#
+# Two things are specific to this image. First, the toolset compilers are
+# reached by absolute path here rather than through PATH: the ENV block that
+# puts /opt/rh/toolset/bin on PATH comes later in the file, so at this point
+# `gcc` would still resolve to RHEL's older system compiler and the check would
+# be testing the wrong thing. Second, clang is optional -- llvm-toolset is
+# installed with --skip-unavailable, so its absence is a documented outcome
+# rather than a failure.
+RUN set -eux; \
+    for t in cmake ninja ccache git python3 gdb; do \
+        command -v "$t" >/dev/null || { echo "FATAL: $t missing after install" >&2; exit 1; }; \
+    done; \
+    for t in readelf objdump nm; do \
+        command -v "$t" >/dev/null \
+            || echo "note: $t missing (binutils did not install)" >&2; \
+    done; \
+    for t in python pip ruff mypy pytest uv; do \
+        [ -x "${VIRTUAL_ENV}/bin/$t" ] || { echo "FATAL: venv tool $t missing" >&2; exit 1; }; \
+    done; \
+    test -x /opt/rh/toolset/bin/gcc || { echo "FATAL: no toolset gcc" >&2; exit 1; }; \
+    test -x /opt/rh/toolset/bin/g++ || { echo "FATAL: no toolset g++" >&2; exit 1; }; \
+    printf 'int main(){return 0;}\n' > /tmp/t.cpp; \
+    # Static linking must work, not merely be intended: the runtime archives
+    # (libc.a, libm.a, libstdc++.a) come from separate packages on rpm distros
+    # and their absence surfaces as "cannot find -lc" at a user's first -static.
+    printf '#include <string>\n#include <vector>\nint main(){std::string s="ok"; std::vector<int> v{1,2}; return (s.size()==2 && v.size()==2)?0:1;}\n' > /tmp/tstatic.cpp; \
+    g++ -std=c++17 -static /tmp/tstatic.cpp -o /tmp/tstatic; \
+    /tmp/tstatic; \
+    rm -f /tmp/tstatic.cpp /tmp/tstatic; \
+    /opt/rh/toolset/bin/g++ -std=c++23 /tmp/t.cpp -o /tmp/t.gcc; \
+    /opt/rh/toolset/bin/gcc --version | head -1; \
+    if [ -x /opt/rh/toolset-llvm/bin/clang++ ]; then \
+        /opt/rh/toolset-llvm/bin/clang++ -std=c++23 /tmp/t.cpp -o /tmp/t.clang; \
+        /opt/rh/toolset-llvm/bin/clang++ --version | head -1; \
+    elif command -v clang++ >/dev/null 2>&1; then \
+        clang++ -std=c++23 /tmp/t.cpp -o /tmp/t.clang; \
+        clang++ --version | head -1; \
+    else \
+        echo "note: this image has no clang (llvm-toolset unavailable on this release)"; \
+    fi; \
+    "${VIRTUAL_ENV}/bin/python" -c 'import sys; assert sys.version_info >= (3, 12), sys.version'; \
+    rm -f /tmp/t.cpp /tmp/t.gcc /tmp/t.clang
+
+# ---- Claude Code from the signed dnf repository ----------------------------
+RUN set -eux; \
+    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /tmp/claude-code.asc; \
+    gpg --show-keys --with-colons /tmp/claude-code.asc \
+        | grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'; \
+    rpmkeys --import /tmp/claude-code.asc; \
+    rm -f /tmp/claude-code.asc; \
+    printf '%s\n' \
+        '[claude-code]' \
+        'name=Claude Code' \
+        "baseurl=https://downloads.claude.ai/claude-code/rpm/${CLAUDE_CHANNEL}" \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'gpgkey=https://downloads.claude.ai/keys/claude-code.asc' \
+        > /etc/yum.repos.d/claude-code.repo; \
+    if [ -n "${CLAUDE_VERSION}" ]; then \
+        dnf -y --nodocs install "claude-code-${CLAUDE_VERSION}"; \
+    else \
+        dnf -y --nodocs install claude-code; \
+    fi; \
+    dnf clean all; \
+    rm -rf /var/cache/dnf
+
+# ---- optional third-party AI agents ----------------------------------------
+# Empty by default. See shared/install-agents.sh for what each agent is and how
+# it is distributed; only OpenAI's codex ships a native Linux binary, the others
+# are npm packages and need WITH_NODE=1.
+ARG AI_AGENTS=""
+ARG WITH_NODE=0
+ARG CODEX_VERSION=
+ARG CODEX_SHA256=
+ARG GEMINI_VERSION=latest
+ARG GROK_VERSION=latest
+
+# nodejs-full-i18n is named explicitly because it is a *weak* dependency of
+# nodejs, and this image installs with install_weak_deps=False. Without it the
+# distro Node has ICU break-iterator data missing: `new Intl.Segmenter()`
+# succeeds and the first `.segment()` call dereferences a null BreakIterator
+# inside V8, which is a native SIGSEGV, not a catchable error (nodejs/node#51752).
+# Agent TUIs use Intl.Segmenter for grapheme widths, so this crashed Gemini at
+# startup with a multi-hundred-megabyte core dump and no JS stack.
+COPY --chmod=0755 shared/install-agents.sh /usr/local/bin/install-agents.sh
+COPY --chmod=0755 shared/install-langs.sh  /usr/local/bin/install-langs.sh
+
+# Optional language toolchains. Empty by default: C++ and Python are the base
+# image. See shared/install-langs.sh for what each name installs per distro.
+ARG LANGS=""
+RUN AI_BOX_BUILD=1 /usr/local/bin/install-langs.sh "${LANGS}"
+
+# Node is installed by install-agents.sh when an npm-based agent is requested,
+# or unconditionally when WITH_NODE=1. It lives there rather than here so that a
+# build FROM a published base takes exactly the same path as this one.
+RUN set -eux; \
+    if [ "${WITH_NODE}" = "1" ]; then \
+        AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh --node-only; \
+    fi; \
+    CODEX_VERSION="${CODEX_VERSION}" CODEX_SHA256="${CODEX_SHA256}" \
+    GEMINI_VERSION="${GEMINI_VERSION}" \
+    GROK_VERSION="${GROK_VERSION}" \
+    AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh "${AI_AGENTS}"
+
+# ---- unprivileged user -----------------------------------------------------
+RUN set -eux; \
+    if ! getent group "${GID}" >/dev/null; then groupadd -g "${GID}" "${USERNAME}"; fi; \
+    useradd -m -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"; \
+    install -d -o "${UID}" -g "${GID}" -m 0755 /workspace \
+        "/home/${USERNAME}/.claude" \
+        "/home/${USERNAME}/.config" \
+        "/home/${USERNAME}/.claude/agents/codex" \
+        "/home/${USERNAME}/.claude/agents/gemini" \
+        "/home/${USERNAME}/.claude/agents/grok" \
+        /opt/toolchains; \
+    chown -R "${UID}:${GID}" "${VIRTUAL_ENV}"; \
+    if [ -d "${UV_PYTHON_INSTALL_DIR}" ]; then chown -R "${UID}:${GID}" "${UV_PYTHON_INSTALL_DIR}"; fi; \
+    rm -f /etc/sudoers.d/* 2>/dev/null || true; \
+    dnf -y remove sudo 2>/dev/null || rpm -e --nodeps sudo 2>/dev/null || true; \
+    dnf clean all 2>/dev/null || true
+
+# The venv chown is not cosmetic and is not allowed to fail quietly: an
+# unwritable /opt/venv turns every in-session `pip install` into a permission
+# error, which is the exact failure the venv exists to prevent. The uv
+# directory only exists when UV_PYTHON was given, hence the test rather than a
+# swallowed error.
+
+# ---- caches live in the workspace, not in the image or a side mount ---------
+# Every cache belongs to the project being worked on, so it lands in the bind-mounted
+# project directory and is deleted with it. That removes the ccache bind mount
+# entirely: the default run path is now the project directory and the Claude Code
+# state directory, and nothing else.
+#
+# Both the symlink and XDG_CACHE_HOME are set, deliberately. They catch different
+# misbehaviour: the variable covers tools that honour XDG but do not use ~/.cache
+# literally, and the symlink covers tools that expand ~/.cache themselves and ignore
+# XDG, which is common. Setting one and not the other leaves a gap.
+#
+# Per image, via CACHE_KEY. ccache is safe to share across distros because it keys on
+# a hash of the compiler binary, but pip is not: a wheel built from an sdist carries
+# the tag linux_x86_64 on both, so one compiled under Fedora's toolchain could be
+# reused under Ubuntu's. For an image whose purpose is C++ and Python together, that
+# is the failure to design out rather than hope about.
+#
+# This must come after every build step that writes to ~/.cache, because from here on
+# ~/.cache resolves into a directory that does not exist until a workspace is mounted.
+ARG CACHE_KEY=rocky
+RUN set -eux; \
+    rm -rf "/home/${USERNAME}/.cache"; \
+    ln -s "/workspace/.cache-${CACHE_KEY}" "/home/${USERNAME}/.cache"
+
+ENV HOME=/home/${USERNAME} \
+    USER=${USERNAME} \
+    CCACHE_DIR=/workspace/.ccache-${CACHE_KEY} \
+    XDG_CACHE_HOME=/workspace/.cache-${CACHE_KEY} \
+    CCACHE_MAXSIZE=2G \
+    CMAKE_GENERATOR=Ninja \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    PATH=/usr/lib64/ccache:/home/${USERNAME}/.local/bin:/opt/venv/bin:/opt/toolchains/bin:/opt/rh/toolset/bin:/opt/rh/toolset-llvm/bin:/usr/bin:/usr/local/bin:/bin \
+    LD_LIBRARY_PATH=/opt/rh/toolset/lib64 \
+    TERM=xterm-256color \
+    GROK_HOME=/home/${USERNAME}/.claude/agents/grok \
+    GEMINI_CLI_HOME=/home/${USERNAME}/.claude/agents/gemini \
+    CODEX_HOME=/home/${USERNAME}/.claude/agents/codex \
+    DISABLE_AUTOUPDATER=1
+
+RUN if [ -x /usr/bin/fd ]; then ln -sf /usr/bin/fd /usr/local/bin/fdfind; fi
+
+# Create the destination directories explicitly, with an explicit mode.
+# BuildKit applies a COPY's --chmod to any parent directory it has to create
+# (moby/buildkit#5943), so `COPY --chmod=0644 x /usr/local/lib/ai-box/x`
+# leaves that directory mode 0644, with no execute bit and therefore not
+# traversable by an unprivileged user. Root ignores directory permissions, so
+# every build step still passed and the failure only appeared on the first
+# non-root run: "keyfile-lib.sh: Permission denied".
+RUN install -d -m 0755 /usr/local/lib/ai-box /usr/local/share/ai-box
+
+COPY --chmod=0755 shared/entrypoint.sh       /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 shared/toolchain-report.sh /usr/local/bin/toolchain-report.sh
+# The key-file parser the entrypoint sources. Shipping the same file the host
+# scripts source is what keeps the two ends from disagreeing about a profile.
+COPY --chmod=0644 shared/keyfile-lib.sh      /usr/local/lib/ai-box/keyfile-lib.sh
+COPY shared/settings.example.json            /usr/local/share/ai-box/settings.example.json
+
+# CCACHE_DISABLE, because /usr/lib/ccache is first on PATH and CCACHE_DIR now
+# points into /workspace: without it, `gcc --version` here goes through the
+# ccache shim, which initialises its cache directory and leaves root-owned files
+# in the directory a project is later mounted over.
+RUN AI_BOX_PACKAGE_VERSION="${PACKAGE_VERSION}" CCACHE_DISABLE=1 \
+    /usr/local/bin/toolchain-report.sh
+
+# /workspace is a mount point and must be empty in the image. Anything left here
+# is invisible at run time, because the bind mount hides it, so it can only bloat
+# the image and confuse a later step. Cleaned as root, while that is still
+# possible, and asserted rather than assumed.
+RUN set -eux; \
+    rm -rf /workspace/.cache-* /workspace/.ccache-*; \
+    if [ -n "$(ls -A /workspace)" ]; then \
+        echo "FATAL: /workspace is not empty in the image:" >&2; ls -lA /workspace >&2; exit 1; \
+    fi
+
+USER ${USERNAME}
+
+# Everything above ran as root, and root bypasses directory permission checks,
+# so no check above this line can see a path the real user cannot reach.
+# Read-only on purpose. It asserts reachability, which is the thing root cannot
+# check, and nothing else. Executing the entrypoint here would create cache
+# directories that this user may not be able to clean up again, which is exactly
+# how 1.6.3 broke the build. The entrypoint is exercised by smoke-test.sh
+# against a built image, where a failure costs a test run and not a build.
+RUN set -eux; \
+    for d in /usr/local/lib/ai-box /usr/local/share/ai-box; do \
+        test -x "$d" || { echo "FATAL: $d is not traversable: $(stat -c %a "$d")" >&2; exit 1; }; \
+    done; \
+    test -x /usr/local/bin/entrypoint.sh; \
+    test -r /usr/local/share/ai-box/settings.example.json; \
+    bash -c 'source /usr/local/lib/ai-box/keyfile-lib.sh; \
+             [ "$(aibox_key_var oauth)" = CLAUDE_CODE_OAUTH_TOKEN ]'; \
+    # Hard rule 2, asserted rather than assumed. A base image can start shipping
+    # sudo at any release; this makes that a failed build instead of a checker
+    # failure discovered later against a built artifact.
+    ! command -v sudo >/dev/null 2>&1 || { echo "FATAL: sudo present" >&2; exit 1; }; \
+    test -z "$(ls -A /workspace)"
+WORKDIR /workspace
+# Shell form, not JSON: the JSON form does no variable expansion, so a build
+# with --build-arg USERNAME=... used to declare volumes for a user that the
+# image does not have.
+# Only the Claude Code state directory. A VOLUME at ~/.cache/ccache would now be
+# declared through a symlink into the bind-mounted workspace, which creates an
+# anonymous volume that shadows the real target and silently discards the cache.
+VOLUME /home/${USERNAME}/.claude
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/bin/bash", "-l"]
+
+LABEL org.opencontainers.image.title="ai-fedora44" \
+      org.opencontainers.image.description="Rocky Linux 10 dev toolchain + Claude Code, unprivileged, no host access" \
+      org.opencontainers.image.base.name="docker.io/rockylinux/rockylinux:10"
+
+# image.source is what links a published package to its repository on GHCR:
+# without it the package page has no README, licence or provenance.
+LABEL org.opencontainers.image.source="https://github.com/erez-strauss/ai-box" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${PACKAGE_VERSION}" \
+      com.ai-box.os-updates="${OS_UPDATES}" \
+      com.ai-box.os-tag="${OS_TAG}" \
+      com.ai-box.update-stamp="${UPDATE_STAMP}" \
+      com.ai-box.package-version="${PACKAGE_VERSION}"

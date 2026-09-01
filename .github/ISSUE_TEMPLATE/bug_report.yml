@@ -1,0 +1,39 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys or the contents of `~/.aikeys`. `ai-box-doctor` prints
+        fingerprints, never keys, and is safe to paste.
+
+        For a security issue - a host path reachable from a container that is not in
+        the mount inventory, or a credential leaking into an image - use the Security
+        tab's private reporting instead.
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: "`cat VERSION`"
+    validations:
+      required: true
+  - type: dropdown
+    id: image
+    attributes:
+      label: Image
+      options: [ai-ubuntu, ai-fedora, ai-rocky, all, not image-specific]
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: ai-box-doctor output
+      render: text
+  - type: textarea
+    id: repro
+    attributes:
+      label: What you ran, what happened, what you expected
+      description: The exact command line matters; most reports here have turned on a flag.
+    validations:
+      required: true

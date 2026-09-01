@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# ai-box -- run Claude Code in an isolated container over ONE project directory.
+#
+#   ai-box                    interactive shell, default image (Fedora), $PWD mounted
+#   ai-box -i fedora -- claude
+#   ai-box -a pass -- claude --dangerously-skip-permissions
+#   ai-box -n                 print the run command instead of running it
+#
+# Nothing from the host is visible inside except the project directory, the
+# per-image state directory, and (optionally) a mounted key file.
+set -euo pipefail
+# shellcheck source=lib-common.sh
+source "$(dirname "$(readlink -f "$0")")/lib-common.sh"
+
+require_host
+
+IMAGE_KEY="${AI_BOX_IMAGE:-${DEFAULT_IMAGE_KEY}}"
+PROJECT_DIR="$PWD"
+AUTH_MODE="${AI_BOX_AUTH:-auto}"        # auto | keyfile | login | envfile | pass | none
+KEY_PROFILE=""
+DEBUG_CAPS=0
+DRY_RUN=0
+SELF_UPDATE="${AI_BOX_SELF_UPDATE:-0}"  # 1 = persist a user-space native install
+NETWORK=""
+MEMORY="${AI_BOX_MEMORY:-12g}"
+CPUS="${AI_BOX_CPUS:-$(nproc)}"
+PASS_ENTRY="${AI_BOX_PASS_ENTRY:-anthropic/claude-code-api-key}"
+PASS_KIND="${AI_BOX_PASS_KIND:-}"       # api | oauth | bearer; empty = detect
+
+usage() {
+    cat <<'USAGE'
+usage: ai-box [-i ubuntu|fedora|rocky|REF] [-p DIR] [-a MODE] [-k PROFILE|PATH]
+                  [-N NETWORK] [-d] [-u] [-n] [-- CMD ...]
+  -i  image: ubuntu|fedora|rocky|REF
+                               (default: fedora; set AI_BOX_DEFAULT_IMAGE,
+                                or DEFAULT_IMAGE= in ~/.config/ai-box/config)
+  -p  project dir to mount     (default: current directory)
+  -k  key profile name, or a path to a key file (implies -a keyfile)
+  -a  auth mode                (default: auto; or $AI_BOX_AUTH)
+        auto    use ~/.aikeys if a profile resolves, else fall back to login
+        keyfile mount a key from ~/.aikeys read-only; no browser needed
+        login   browser OAuth once; token persists in the state dir
+        envfile ~/.config/ai-box/anthropic.env  (mode 0600)
+        pass    read the key from `pass`, mount it as a file, never in env
+        none    no credential at all (build/inspect only)
+  -N  container network        (e.g. none, or an allowlisted proxy network)
+  -d  debug mode: add SYS_PTRACE + unconfined seccomp for gdb/valgrind
+  -u  self-update mode: persist ~/.local/{bin,share/claude} so `claude update`
+      survives container restarts without an image rebuild
+  -n  dry run: print the exact engine argv, one word per line, and exit. This is
+      what scripts/verify-isolation.sh asserts against, so the checks cannot
+      drift away from the command that actually runs.
+  -v  verbose: run this script under `set -vx`, echoing every line and every
+      expansion. Use it when the container starts but not the way you expected;
+      it shows the exact argv before the engine sees it.
+  -V, --version   version, where this command lives, and where the package is
+  -h, --help      this text
+  --  everything after is the command to run instead of an interactive shell
+
+examples:
+  ai-box                                  shell in the default image, $PWD mounted
+  ai-box -i ubuntu -- claude              run an agent in a specific image
+  ai-box -k work -p ~/src/proj -- bash    a named key profile, a chosen project
+  ai-box -n                               print the engine argv and exit
+  ai-box -d -- gdb ./a.out                debugging: adds SYS_PTRACE
+
+environment: AI_BOX_MEMORY AI_BOX_CPUS AI_BOX_STATE AI_BOX_CONFIG
+             AI_BOX_PASS_ENTRY AI_BOX_PASS_KIND AI_BOX_DEFAULT_IMAGE
+             AI_BOX_ENGINE AI_BOX_REGISTRY
+USAGE
+    printf '\ninstalled:\n'
+    printf '  command   %s\n' "$(where_am_i "$0")"
+    printf '  package   %s (version %s)\n' "$PKG_ROOT" "$PKG_VERSION"
+    printf '  keys      %s\n' "$KEYS_DIR"
+    printf '  state     %s\n' "$STATE_ROOT"
+    printf '\ndocumentation: %s/README.md\n' "$PKG_ROOT"
+    printf 'newer releases: %s/releases\n' "$PROJECT_URL"
+}
+
+# Long options first: getopts handles single characters only, and --version and
+# --help are the two a user is most likely to type in full.
+_argv=()
+for _a in "$@"; do
+    case "$_a" in
+        --version) print_version "$0"; exit 0 ;;
+        --help)    usage; exit 0 ;;
+        --verbose) _argv+=(-v) ;;
+        *)         _argv+=("$_a") ;;
+    esac
+done
+set -- "${_argv[@]+"${_argv[@]}"}"
+unset _argv _a
+
+while getopts ":i:p:a:k:N:dunvVh" opt; do
+    case "$opt" in
+        i) IMAGE_KEY="$OPTARG" ;;
+        p) PROJECT_DIR="$OPTARG" ;;
+        a) AUTH_MODE="$OPTARG" ;;
+        k) KEY_PROFILE="$OPTARG"; AUTH_MODE="keyfile" ;;
+        N) NETWORK="$OPTARG" ;;
+        d) DEBUG_CAPS=1 ;;
+        u) SELF_UPDATE=1 ;;
+        n) DRY_RUN=1 ;;
+        v) set -vx ;;                 # echo every line and every expansion
+        V) print_version "$0"; exit 0 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+IMAGE="$(image_ref "$IMAGE_KEY")"
+if (( DRY_RUN )); then
+    # A dry run only prints a command, so it stays useful on a host without a
+    # container engine; everything that would touch one is guarded below.
+    command -v "$ENGINE" >/dev/null 2>&1 || warn "$ENGINE not found; printing the command anyway"
+else
+    require_engine
+    image_exists "$IMAGE" || die "image $IMAGE not built; run scripts/build.sh ${IMAGE_KEY}"
+fi
+
+PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" || die "no such directory"
+
+# ---- mount guard ------------------------------------------------------------
+# One project directory, never a tree of them and never a directory whose whole
+# purpose is to hold credentials. The point of the product is that ~/.ssh and
+# friends are unreachable; mounting one of them by hand would make the promise
+# in README.md false without any warning.
+# Exact-match arms: a project legitimately lives *under* these, so only the
+# directory itself is refused.
+case "$PROJECT_DIR" in
+    "$HOME"|/|/home)
+        die "refusing to mount $PROJECT_DIR -- mount one project directory, not a tree of them" ;;
+esac
+
+# refuse_under <dir> <why> -- refuse the directory and everything beneath it.
+#
+# Both sides are canonicalised. PROJECT_DIR is already resolved with `pwd -P`,
+# so comparing it against an unresolved target let a symlinked store through:
+# with ~/.aikeys a symlink to /mnt/secrets/aikeys, `-p /mnt/secrets/aikeys`
+# passed every check.
+refuse_under() {
+    local d="$1" why="$2" rd
+    rd="$(readlink -f "$d" 2>/dev/null || printf '%s' "$d")"
+    [[ -n "$rd" ]] || return 0
+    if [[ "$PROJECT_DIR" == "$rd" || "$PROJECT_DIR" == "$rd"/* ]]; then
+        die "refusing to mount $PROJECT_DIR -- $why"
+    fi
+}
+
+# System trees, refused by PREFIX. These were exact matches, which meant /etc was
+# refused while /etc/ssh, /var/log, /root/.ssh and /usr/local/src were all
+# accepted -- precisely the "by hand" case the README promises to refuse.
+for _tree in /root /etc /usr /var /opt /boot /proc /sys /dev /srv /mnt /media; do
+    refuse_under "$_tree" "that is a system directory, not a project"
+done
+unset _tree
+
+# /tmp and /var/tmp are refused as themselves but NOT by prefix. Mounting all of
+# /tmp hands over every socket and scratch secret on the host, which is the case
+# worth refusing. A specific directory under it is an ordinary scratch project,
+# and prefix-refusing would break the package's own tooling: verify-isolation.sh
+# and smoke-test.sh both build their probe workspace with `mktemp -d` under /tmp.
+case "$PROJECT_DIR" in
+    /tmp|/var/tmp)
+        die "refusing to mount $PROJECT_DIR -- that is the whole temp directory.
+       A specific directory under it is fine: -p $PROJECT_DIR/myproject" ;;
+esac
+refuse_under "$KEYS_DIR"    "that is the credential store, and /workspace is writable by the agent"
+refuse_under "$STATE_ROOT"  "that is ai-box's own state directory"
+for _sensitive in .ssh .gnupg .aws .kube .docker .config .local .password-store; do
+    refuse_under "$HOME/$_sensitive" "that directory holds host credentials or configuration"
+done
+unset _sensitive
+
+# .ai-profile is meant to be committed, so a credential in it is already a
+# leak. Checked here, in the parent shell, and not inside resolve_key_profile:
+# that one runs in a command substitution where die() kills only the subshell.
+assert_profile_file_sane "$PROJECT_DIR"
+
+STATE="$(state_dir "$IMAGE")"
+mkdir -p "$STATE/claude" "$STATE/local-bin" "$STATE/local-share-claude"
+# Only the directories, never -R: this used to walk a ccache holding hundreds of
+# thousands of files on every launch, which cost seconds per start.
+chmod go-rwx "$STATE_ROOT" "$STATE" "$STATE/claude" \
+    "$STATE/local-bin" "$STATE/local-share-claude" 2>/dev/null || true
+
+# Since 1.6.2 the compiler cache lives in the project directory, not here. Say so
+# once rather than leaving several GB of orphaned cache on disk unexplained.
+if [[ -d "$STATE/ccache" ]] && [[ -n "$(ls -A "$STATE/ccache" 2>/dev/null)" ]]; then
+    warn "$STATE/ccache is left over from before 1.6.2; caches now live in the project directory.
+       It is safe to delete:  rm -rf $STATE/ccache"
+fi
+
+# ---- config state -----------------------------------------------------------
+# Claude Code keeps .claude.json next to ~/.claude by default. Bind-mounting that
+# single FILE is a trap: a single-file mount cannot be replaced by rename(), so
+# an atomic write fails and an in-place write that is interrupted leaves a
+# truncated file. Either way the next start reports "JSON Parse error:
+# Unexpected EOF". CLAUDE_CONFIG_DIR moves .claude.json inside the directory we
+# already mount, where rename() works normally.
+CONFIG_DIR_IN_CONTAINER=/home/dev/.claude
+
+CFG="$STATE/claude/.claude.json"
+
+# Migrate the old single-file layout, once.
+if [[ -f "$STATE/claude.json" ]]; then
+    if json_ok "$STATE/claude.json" && [[ ! -e "$CFG" ]]; then
+        mv "$STATE/claude.json" "$CFG"
+        log "migrated claude.json into the config directory"
+    else
+        rm -f "$STATE/claude.json"      # empty, truncated, or superseded
+    fi
+fi
+
+# Repair a config file that a previous run left empty or truncated, so the user
+# is not met with a "Reset with default configuration" prompt on every start.
+if [[ -e "$CFG" ]] && ! json_ok "$CFG"; then
+    mkdir -p "$STATE/claude/backups"
+    mv "$CFG" "$STATE/claude/backups/.claude.json.corrupted.$(date +%s)"
+    warn "config file was invalid JSON; backed it up and started fresh"
+fi
+[[ -e "$CFG" ]] || printf '{}\n' > "$CFG"
+
+# On an SELinux host a bind mount with no label option is unreadable inside the
+# container, and the error is a bare "permission denied". Empty everywhere else.
+Z="$(selinux_relabel_opt)"
+SECRET_RELABEL="$(secret_mount_relabel_opt)"
+
+RUN_ARGS=(
+    --rm --interactive --tty --init
+    --hostname "$(safe_hostname "$IMAGE_KEY")"
+    --user "$(id -u):$(id -g)"
+    --cap-drop=ALL
+    --security-opt no-new-privileges
+    --pids-limit 8192
+    --memory "$MEMORY" --cpus "$CPUS"
+    --workdir /workspace
+    --volume "$PROJECT_DIR:/workspace${Z}"
+    --volume "$STATE/claude:${CONFIG_DIR_IN_CONTAINER}${Z}"
+    --env "CLAUDE_CONFIG_DIR=${CONFIG_DIR_IN_CONTAINER}"
+    --tmpfs "/tmp:rw,nosuid,nodev,exec,size=4g"
+    --env "TERM=${TERM:-xterm-256color}"
+    --env "AI_BOX_PROJECT=$(basename "$PROJECT_DIR")"
+    # Which image this is, so project conventions can key off it without the
+    # user writing the name by hand: build/$AI_BOX_IMAGE-gcc, .venv-$AI_BOX_IMAGE.
+    # Not a credential and not a mount; the same string is already visible in the
+    # hostname and in /etc/toolchain-versions.
+    --env "AI_BOX_IMAGE=${IMAGE_KEY}"
+)
+
+# Engine-specific flags (podman's --userns=keep-id). Without keep-id, rootless
+# podman maps the container's `dev` user onto a subordinate UID and every file
+# the agent writes into /workspace comes out owned by a number nobody on the host is.
+# The list lives in lib-common.sh so the probe containers in verify-isolation.sh
+# and smoke-test.sh get exactly the same treatment.
+RUN_ARGS+=( "${ENGINE_RUN_EXTRA[@]+"${ENGINE_RUN_EXTRA[@]}"}" )
+
+if [[ -n "$NETWORK" ]]; then
+    RUN_ARGS+=( --network "$NETWORK" )
+fi
+if (( DEBUG_CAPS )); then
+    RUN_ARGS+=( --cap-add=SYS_PTRACE --security-opt seccomp=unconfined )
+fi
+
+if (( SELF_UPDATE )); then
+    RUN_ARGS+=(
+        --volume "$STATE/local-bin:/home/dev/.local/bin"
+        --volume "$STATE/local-share-claude:/home/dev/.local/share/claude"
+        --env "DISABLE_AUTOUPDATER=0"
+    )
+fi
+
+# Optional shared toolchain volume (custom GCC/LLVM builds), if it exists.
+if command -v "$ENGINE" >/dev/null 2>&1 && "$ENGINE" volume inspect ai-toolchains >/dev/null 2>&1; then
+    RUN_ARGS+=( --volume "ai-toolchains:/opt/toolchains" )
+fi
+
+CLEANUP_DIR=""
+cleanup() {
+    [[ -n "${CLEANUP_DIR:-}" && -d "$CLEANUP_DIR" ]] || return 0
+    shred -u "$CLEANUP_DIR/key" 2>/dev/null || rm -f "$CLEANUP_DIR/key"
+    rmdir "$CLEANUP_DIR" 2>/dev/null || true
+    CLEANUP_DIR=""
+}
+trap cleanup EXIT INT TERM
+
+# Mount a key file read-only and tell the entrypoint which variable to export.
+# A mounted file keeps the secret out of `docker inspect` and out of the host
+# process list, unlike -e / --env.
+mount_key_file() {
+    local path="$1" kind var envfile
+    path="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+    [[ -r "$path" ]] || die "key file not readable: $path"
+    case "$(stat -c '%a' "$path")" in
+        600|400) ;;
+        *) warn "$path is not mode 0600; fix with: chmod 600 $path" ;;
+    esac
+    case "$(cd "$(dirname "$path")" && pwd -P)/" in
+        "$PROJECT_DIR"/*|"$PROJECT_DIR"/)
+            die "refusing to use a key stored inside the mounted project directory.
+       $path is writable by the agent and one 'git add .' from a public repo.
+       Move it: ai-keys add <profile>   (stores it in $KEYS_DIR)" ;;
+    esac
+
+    kind="$(aibox_key_kind "$path")"
+    if ! var="$(aibox_key_var "$kind")"; then
+        die "profile $(basename "$path") declares kind '${kind}', which is not one this
+       package knows. Valid kinds: api, oauth, bearer, openai, gemini, grok.
+       Exporting the wrong variable silently outranks the right credential, so
+       this refuses rather than guessing."
+    fi
+    RUN_ARGS+=(
+        --mount "type=bind,src=$path,dst=/run/secrets/ai-key,ro${SECRET_RELABEL}"
+        --env "AI_BOX_KEY_VAR=$var"
+    )
+    envfile="${path%.key}.env"
+    if [[ -r "$envfile" ]]; then
+        case "$(stat -c '%a' "$envfile")" in
+            600|400|644) ;;
+            *) warn "$envfile is not mode 0600; fix with: chmod 600 $envfile" ;;
+        esac
+        RUN_ARGS+=( --mount "type=bind,src=$envfile,dst=/run/secrets/ai-key-env,ro${SECRET_RELABEL}" )
+    fi
+    KEY_DESC="$(basename "$path") (kind=$kind -> $var)"
+}
+
+resolve_and_mount_profile() {
+    local want="${1:-}" path
+    if [[ -z "$want" ]]; then
+        want="$(resolve_key_profile "$PROJECT_DIR")"
+    fi
+    if [[ "$want" == */* || "$want" == *.key ]]; then
+        path="$want"                       # an explicit path
+    else
+        path="$(key_profile_path "$want")"
+    fi
+    [[ -r "$path" ]] || return 1
+    mount_key_file "$path"
+    return 0
+}
+
+KEY_DESC=""
+case "$AUTH_MODE" in
+    auto)
+        if ! resolve_and_mount_profile ""; then
+            AUTH_MODE=login                # nothing in the store; fall through
+        fi ;;
+    keyfile)
+        resolve_and_mount_profile "$KEY_PROFILE" || {
+            p="${KEY_PROFILE:-$(resolve_key_profile "$PROJECT_DIR")}"
+            die "no key for profile '$p' (looked in $KEYS_DIR).
+       Create one without a browser:  ai-keys add $p
+       See docs/credentials.md"
+        } ;;
+    login|oauth|none) : ;;   # "oauth" kept as an alias for older invocations
+    envfile)
+        [[ -r "$CONFIG_ROOT/anthropic.env" ]] \
+            || die "missing $CONFIG_ROOT/anthropic.env (see shared/anthropic.env.example)"
+        RUN_ARGS+=( --env-file "$CONFIG_ROOT/anthropic.env" ) ;;
+    pass)
+        need pass
+        CLEANUP_DIR="$(mktemp -d /dev/shm/ai-box.XXXXXX)"; chmod 700 "$CLEANUP_DIR"
+        ( umask 077; pass show "$PASS_ENTRY" | tr -d '\r\n' > "$CLEANUP_DIR/key" )
+        [[ -s "$CLEANUP_DIR/key" ]] || die "pass entry '$PASS_ENTRY' is empty"
+        # The staged file carries no metadata, so the kind has to come from the
+        # value or from AI_BOX_PASS_KIND. Getting this wrong exports a
+        # variable that silently outranks the credential (see hard rule 11).
+        _pass_kind="$PASS_KIND"
+        if [[ -z "$_pass_kind" ]]; then
+            _pass_kind="$(aibox_key_kind "$CLEANUP_DIR/key")"
+        fi
+        _pass_var="$(aibox_key_var "$_pass_kind")"
+        RUN_ARGS+=(
+            --mount "type=bind,src=$CLEANUP_DIR/key,dst=/run/secrets/ai-key,ro${SECRET_RELABEL}"
+            --env "AI_BOX_KEY_VAR=$_pass_var"
+        )
+        KEY_DESC="pass:$PASS_ENTRY (kind=$_pass_kind -> $_pass_var)" ;;
+    *) die "unknown auth mode: $AUTH_MODE" ;;
+esac
+
+if [[ -n "$KEY_DESC" && -t 2 ]]; then
+    log "credential: $KEY_DESC"
+fi
+
+if (( DRY_RUN )); then
+    # One word per line so a checker can compare argv exactly. The key file is
+    # named here, never its contents.
+    printf '%s\n' "$ENGINE" run "${RUN_ARGS[@]}" "$IMAGE" "$@"
+    exit 0
+fi
+
+# Deliberately not `exec`: an exec'd process replaces this shell, so the EXIT
+# trap would never fire and a `pass`-staged key would be left in /dev/shm for
+# the rest of the host's uptime.
+rc=0
+"$ENGINE" run "${RUN_ARGS[@]}" "$IMAGE" "$@" || rc=$?
+cleanup
+exit "$rc"

@@ -1,0 +1,71 @@
+# Alternative to scripts/ai-box, for people who prefer compose.
+# Run from the PACKAGE ROOT (the build context must include shared/):
+#
+#   export UID GID="$(id -g)" PROJECT_DIR=~/src/myproject
+#   docker compose -f shared/compose.yaml run --rm fedora
+#
+# Caches are NOT mounted here. Since caches moved into the workspace,
+# /home/dev/.cache is a symlink into /workspace; binding a volume onto it
+# creates an anonymous volume that shadows the target and silently discards
+# the cache. Caches appear as /workspace/.cache-<image> and .ccache-<image>.
+#
+# Under rootless Podman this file will produce files owned by the wrong uid:
+# it has no --userns=keep-id and no SELinux relabel, both of which scripts/ai-box
+# applies from one place. Use ai-box, or add them here yourself.
+#
+# There is no rocky service: compose is a sketch for the two most common images,
+# not the supported run path.
+#
+# Note: compose does not resolve key profiles, stage a `pass` secret, apply the
+# mount guard, or clean up afterwards. For credentials use scripts/ai-box,
+# which does. If you must use compose, mount a key yourself:
+#   volumes:
+#     - ~/.aikeys/default.key:/run/secrets/ai-key:ro
+# AI_BOX_KEY_VAR is optional here: since 1.4.0 the entrypoint reads the
+# profile's own `kind:` line with the same parser the host uses, so a mounted
+# oauth or bearer profile is exported under the right variable either way.
+
+x-common: &common
+  stdin_open: true
+  tty: true
+  init: true
+  user: "${UID:-1000}:${GID:-1000}"
+  working_dir: /workspace
+  environment:
+    CLAUDE_CONFIG_DIR: /home/dev/.claude
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 8192
+  mem_limit: 12g
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,exec,size=4g
+
+services:
+  ubuntu:
+    <<: *common
+    image: ai-ubuntu:26.04
+    build:
+      context: ..
+      dockerfile: docker-ubuntu/Dockerfile.ai-ubuntu
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+        CLAUDE_CHANNEL: stable
+        OS_UPDATES: "1"
+    volumes:
+      - ${PROJECT_DIR:?set PROJECT_DIR to the one project directory to expose}:/workspace
+      - ${HOME}/.local/share/ai-box/ai-ubuntu_26.04/claude:/home/dev/.claude
+
+  fedora:
+    <<: *common
+    image: ai-fedora:44
+    build:
+      context: ..
+      dockerfile: docker-fedora/Dockerfile.ai-fedora44
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+        CLAUDE_CHANNEL: stable
+    volumes:
+      - ${PROJECT_DIR:?set PROJECT_DIR to the one project directory to expose}:/workspace
+      - ${HOME}/.local/share/ai-box/ai-fedora_44/claude:/home/dev/.claude

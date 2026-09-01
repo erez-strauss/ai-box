@@ -1,0 +1,38 @@
+name: Release
+
+# Tag a release with the version the tree already declares:
+#   git tag v2.1.1 && git push origin v2.1.1
+on:
+  push: {tags: ['v*']}
+
+permissions: {contents: write}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag, VERSION and changelog must agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"; file="$(cat VERSION)"
+          [[ "$tag" == "$file" ]] || { echo "tag v$tag != VERSION $file"; exit 1; }
+          grep -q "^## ${file} " CHANGELOG.md || { echo "no changelog entry for $file"; exit 1; }
+      - run: scripts/pack.sh --stage "$RUNNER_TEMP/dist"
+      - name: checksums
+        working-directory: ${{ runner.temp }}/dist
+        run: sha256sum ./*.tar.gz | tee SHA256SUMS
+      - name: release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v v="$(cat VERSION)" '
+            $0 ~ "^## " v " " {inside=1; next}
+            inside && /^## / {exit}
+            inside {print}
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+      - name: publish
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP/dist/SHA256SUMS"

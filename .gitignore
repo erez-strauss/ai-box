@@ -1,0 +1,39 @@
+# Build outputs
+*.tar.gz
+*.tar.xz
+SHA256SUMS
+dist/
+
+# Never commit credentials. The key store lives in ~/.aikeys, outside any
+# repository; this is a backstop for anyone who ignores that advice.
+*.key
+.aikeys/
+anthropic.env
+!shared/anthropic.env.example
+.credentials.json
+
+# Left behind by running ai-box against this checkout: decision D1 puts caches
+# in the project directory.
+.cache-*/
+.ccache-*/
+core.*
+
+# Agent and IDE state
+.claude/
+.claude.json
+.gemini/
+.codex/
+.grok/
+.idea/
+.vscode/
+build/
+.venv*/
+__pycache__/
+
+# Working notes that are not package content
+*-review*.md
+*-workplan*.md
+
+# Editors / OS
+*.swp
+.DS_Store

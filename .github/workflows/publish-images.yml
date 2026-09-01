@@ -1,0 +1,60 @@
+name: Publish images
+
+# Publishes the three base images to GHCR, WITHOUT optional agents.
+#
+# No agents on purpose: a public image carrying four vendors' CLIs is a
+# redistribution question each vendor's terms answer differently, and most people
+# want one agent. Users add theirs locally with `build.sh --from-registry --agents`,
+# which is seconds rather than the full build.
+on:
+  push: {tags: ['v*']}
+  workflow_dispatch:
+    inputs:
+      tag: {description: 'Tag to publish as', required: false, default: ''}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {image: ubuntu, repo: ai-ubuntu, dockerfile: docker-ubuntu/Dockerfile.ai-ubuntu}
+          - {image: fedora, repo: ai-fedora, dockerfile: docker-fedora/Dockerfile.ai-fedora44}
+          - {image: rocky,  repo: ai-rocky,  dockerfile: docker-rocky/Dockerfile.ai-rocky10}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+      - name: log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: build
+        run: scripts/build.sh ${{ matrix.image }}
+
+      - name: verify before publishing
+        run: |
+          scripts/verify-isolation.sh ${{ matrix.image }}
+          scripts/smoke-test.sh ${{ matrix.image }}
+
+      # Published with UID 1000. A user whose UID differs gets it remapped by the
+      # derive step in build.sh --from-registry; without that, files the agent
+      # writes would be owned by the wrong user on their host.
+      - name: tag and push
+        run: |
+          set -euo pipefail
+          v="${{ github.event.inputs.tag }}"; v="${v:-$(cat VERSION)}"
+          local_ref="$(bash -c 'source scripts/lib-common.sh; image_ref ${{ matrix.image }}')"
+          dest="ghcr.io/${{ github.repository_owner }}/${{ matrix.repo }}"
+          docker tag "$local_ref" "$dest:$v"
+          docker tag "$local_ref" "$dest:latest"
+          docker push "$dest:$v"
+          docker push "$dest:latest"
+          echo "published $dest:$v and $dest:latest"

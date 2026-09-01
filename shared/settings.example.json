@@ -1,0 +1,8 @@
+{
+  "$comment": "Copy into the per-image state dir as claude/settings.json. Auto-updates are disabled because Claude Code is installed from the signed apt/dnf repo and is pinned by the image tag; upgrade by rebuilding the image.",
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "autoUpdatesChannel": "stable"
+}

@@ -1,0 +1,21 @@
+# The build context is the package root; keep it tiny.
+docs/
+examples/
+*.md
+*.tar.gz
+.git/
+.gitignore
+# Repository infrastructure. Only meaningful on GitHub, and it would otherwise
+# end up in the build context of anyone building from a clone.
+.github/
+.hadolint.yaml
+scripts/
+!shared/
+
+# Decision D1 leaves these in any directory ai-box is run against, including a
+# checkout of this package. A populated ccache in the build context is pure waste.
+.cache-*/
+.ccache-*/
+core.*
+.claude/
+tests/

@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# ai-keys -- manage Claude credentials for ai-box, without a browser.
+#
+# Keys live on the HOST in ~/.aikeys (mode 0700), one file per profile,
+# mode 0600. They are never copied into an image, never passed as an env var or
+# a command-line argument, and never stored inside the project directory that
+# the agent can write to. ai-box bind-mounts the selected file read-only at
+# /run/secrets/ai-key and the entrypoint exports it.
+set -euo pipefail
+# shellcheck source=lib-common.sh
+source "$(dirname "$(readlink -f "$0")")/lib-common.sh"
+
+usage() {
+    cat <<'USAGE'
+usage: ai-keys COMMAND [ARGS] [-p DIR]
+
+  init                     create the store at ~/.aikeys (mode 0700)
+  add [PROFILE]            read a key from the terminal with echo off
+  list                     profiles, kinds, fingerprints, target variable
+  which [-p DIR]           which profile a directory resolves to
+  link PROFILE [-p DIR]    pin a project directory to a profile
+  path [PROFILE]           print the resolved key file path
+  rm PROFILE               delete a profile
+  check [PROFILE]          permissions and shape, no network
+  test [PROFILE]           one live API call to verify the credential
+
+A profile file holds the secret on its first line that is neither a comment nor
+"name: value" metadata. "kind: api|oauth|bearer" selects the environment
+variable the container exports; see docs/credentials.md.
+
+environment: AI_KEYS_DIR AI_BOX_KEY_PROFILE
+USAGE
+}
+
+fingerprint() {
+    # Identify a key without revealing it: last 4 chars plus a short hash.
+    local v="$1"
+    printf '...%s / %s' "${v: -4}" "$(printf '%s' "$v" | sha256sum | cut -c1-8)"
+}
+
+require_store() {
+    [[ -d "$KEYS_DIR" ]] || die "no key store at $KEYS_DIR - run: ai-keys init"
+}
+
+# Ask a yes/no question. Without a terminal there is nobody to ask, so the
+# destructive answer is never assumed.
+confirm() {
+    local prompt="$1" reply
+    if [[ ! -r /dev/tty ]]; then
+        die "$prompt needs a terminal to confirm; refusing in a non-interactive shell"
+    fi
+    printf '%s [y/N] ' "$prompt" >&2
+    read -r reply </dev/tty
+    [[ "$reply" =~ ^[Yy]$ ]] || die "unchanged"
+}
+
+# ---- commands --------------------------------------------------------------
+cmd_init() {
+    mkdir -p "$KEYS_DIR/projects"
+    chmod 700 "$KEYS_DIR" "$KEYS_DIR/projects"
+    cat > "$KEYS_DIR/README" <<'EOF'
+Claude credentials for ai-box. One profile per file: <profile>.key, mode 0600.
+
+Each file holds the secret on its first line that is neither a comment nor a
+metadata line. Metadata lines look like "name: value" and only these names are
+recognised: kind, added, note, label, profile, desc, comment, source. Anything
+else is treated as the secret, so a key is never mistaken for a header.
+
+    # a comment
+    kind: api | oauth | bearer      declare the kind instead of guessing
+    sk-ant-...                      the secret
+
+The secret is normally written bare. It may also be written as NAME=value, but
+only for NAME in ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN,
+ANTHROPIC_KEY, API_KEY, TOKEN, KEY. Any other line is taken whole, so a secret
+that itself contains "=" is never truncated.
+
+The optional <profile>.env holds NON-SECRET settings mounted alongside the key
+(ANTHROPIC_BASE_URL, ANTHROPIC_MODEL, ...).
+
+projects/<dirname> pins a project directory to a profile name.
+
+Never put a key inside a project directory: that directory is bind-mounted
+read-write into the container, so the agent and anything it runs can read it,
+and it is one `git add .` away from a public repository.
+EOF
+    chmod 600 "$KEYS_DIR/README"
+    log "key store ready at $KEYS_DIR"
+    [[ -e "$(key_profile_path default)" ]] || log "next: ai-keys add default"
+}
+
+cmd_add() {
+    require_store
+    local profile="${1:-default}" kind="" path value
+    path="$(key_profile_path "$profile")"
+
+    if [[ -e "$path" ]]; then
+        confirm "Profile $profile already exists ($path). Replace it?"
+    fi
+
+    if [[ -t 0 ]]; then
+        printf 'Paste the key for profile "%s" (input hidden, Enter when done): ' "$profile" >&2
+        read -rs value </dev/tty
+        printf '\n' >&2
+    else
+        read -r value                    # piped: ai-keys add ci < key.txt
+    fi
+    value="$(printf '%s' "$value" | tr -d '[:space:]')"
+    [[ -n "$value" ]] || die "empty key, nothing written"
+
+    kind="$(aibox_key_kind_of_value "$value")"
+    if [[ "$kind" == unknown ]]; then
+        warn "unrecognized key prefix; assuming an API key. Edit the 'kind:' line in"
+        warn "$path if this is an OAuth token (oauth) or a gateway bearer token (bearer)."
+        kind=api
+    fi
+
+    ( umask 077; {
+        printf '# ai-box key profile: %s\n' "$profile"
+        printf '# added: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'kind: %s\n' "$kind"
+        printf '%s\n' "$value"
+    } > "$path" )
+    chmod 600 "$path"
+
+    log "wrote $path  (kind=$kind, $(fingerprint "$value") -> $(aibox_key_var "$kind" || echo "UNKNOWN KIND"))"
+    unset value
+}
+
+cmd_list() {
+    require_store
+    local found=0 f profile value kind
+    printf '%-18s %-8s %-28s %s\n' PROFILE KIND FINGERPRINT VARIABLE
+    for f in "$KEYS_DIR"/*.key; do
+        [[ -e "$f" ]] || continue
+        found=1
+        profile="$(basename "$f" .key)"
+        value="$(aibox_key_value "$f" || printf '')"
+        kind="$(aibox_key_kind "$f")"
+        printf '%-18s %-8s %-28s %s\n' \
+            "$profile" "$kind" "$(fingerprint "$value")" "$(aibox_key_var "$kind" || echo "UNKNOWN")"
+    done
+    if (( ! found )); then
+        warn "no profiles yet - ai-keys add default"
+        return 0
+    fi
+
+    if compgen -G "$KEYS_DIR/projects/*" >/dev/null; then
+        printf '\nProject pins:\n'
+        for f in "$KEYS_DIR"/projects/*; do
+            printf '  %-24s -> %s\n' "$(basename "$f")" "$(cat "$f")"
+        done
+    fi
+}
+
+cmd_which() {
+    local dir="${1:-$PWD}" profile path
+    profile="$(resolve_key_profile "$dir")"
+    path="$(key_profile_path "$profile")"
+    printf 'directory : %s\n' "$dir"
+    printf 'profile   : %s\n' "$profile"
+    if [[ -r "$path" ]]; then
+        printf 'key file  : %s (kind=%s)\n' "$path" "$(aibox_key_kind "$path")"
+    else
+        printf 'key file  : %s (MISSING)\n' "$path"
+        return 1
+    fi
+}
+
+cmd_link() {
+    require_store
+    local profile="$1" dir="${2:-$PWD}" base
+    [[ -r "$(key_profile_path "$profile")" ]] || die "no such profile: $profile"
+    base="$(basename "$(cd "$dir" && pwd -P)")"
+    mkdir -p "$KEYS_DIR/projects"
+    printf '%s\n' "$profile" > "$KEYS_DIR/projects/$base"
+    chmod 600 "$KEYS_DIR/projects/$base"
+    log "pinned project '$base' to profile '$profile'"
+}
+
+cmd_path() { printf '%s\n' "$(key_profile_path "${1:-$(resolve_key_profile "$PWD")}")"; }
+
+cmd_rm() {
+    require_store
+    local profile="$1" path
+    path="$(key_profile_path "$profile")"
+    [[ -e "$path" ]] || die "no such profile: $profile"
+    confirm "Delete $path?"
+    shred -u "$path" 2>/dev/null || rm -f "$path"
+    rm -f "${path%.key}.env"
+    log "removed profile $profile"
+}
+
+# report <label> <PASS|FAIL> [detail] -- fixed-width so a run reads as a column
+report() {
+    printf '%-32s %s%s\n' "$1" "$2" "${3:+ ($3)}"
+}
+
+cmd_check() {
+    require_store
+    local profile="${1:-$(resolve_key_profile "$PWD")}" path value kind rc=0
+    local dperm fperm envfile eperm
+    path="$(key_profile_path "$profile")"
+    [[ -r "$path" ]] || die "no key file for profile '$profile' at $path"
+
+    dperm="$(stat -c '%a' "$KEYS_DIR")"
+    if [[ "$dperm" == 700 ]]; then
+        report "store mode 0700" PASS
+    else
+        report "store mode 0700" FAIL "$dperm; chmod 700 $KEYS_DIR"; rc=1
+    fi
+
+    fperm="$(stat -c '%a' "$path")"
+    if [[ "$fperm" == 600 || "$fperm" == 400 ]]; then
+        report "key file mode 0600" PASS
+    else
+        report "key file mode 0600" FAIL "$fperm; chmod 600 $path"; rc=1
+    fi
+
+    envfile="${path%.key}.env"
+    if [[ -e "$envfile" ]]; then
+        eperm="$(stat -c '%a' "$envfile")"
+        if [[ "$eperm" == 600 || "$eperm" == 400 || "$eperm" == 644 ]]; then
+            report "env file mode" PASS "$eperm"
+        else
+            report "env file mode" FAIL "$eperm; chmod 600 $envfile"; rc=1
+        fi
+    fi
+
+    if value="$(aibox_key_value "$path")"; then
+        report "key present" PASS "$(fingerprint "$value")"
+    else
+        value=""
+        report "key present" FAIL "file has no value line"; rc=1
+    fi
+
+    if [[ "$value" =~ [[:space:]] ]]; then
+        report "no stray whitespace" FAIL; rc=1
+    else
+        report "no stray whitespace" PASS
+    fi
+
+    kind="$(aibox_key_kind "$path")"
+    report "kind" "$kind" "-> $(aibox_key_var "$kind" || echo "UNKNOWN KIND, this profile will be refused")"
+
+    # A key inside a project directory is the mistake this store exists to avoid.
+    if [[ "$path" == "$PWD"/* ]]; then
+        report "key outside the project dir" FAIL "it is inside $PWD"; rc=1
+    else
+        report "key outside the project dir" PASS
+    fi
+    return $rc
+}
+
+cmd_test() {
+    require_store
+    need curl
+    local profile="${1:-$(resolve_key_profile "$PWD")}" path value kind header code cfg cfgdir
+    local -a extra
+    local cfgdir="" cfg=""
+    path="$(key_profile_path "$profile")"
+    [[ -r "$path" ]] || die "no key file for profile '$profile'"
+    value="$(aibox_key_value "$path")" || die "no key value in $path"
+    kind="$(aibox_key_kind "$path")"
+
+    # Each vendor has its own endpoint and its own auth header. Probing every
+    # kind against api.anthropic.com with x-api-key returned 401 for a perfectly
+    # good xAI or Google key and reported it as "key rejected" -- the same class
+    # of failure hard rule 11 exists for, one layer up.
+    local url method data
+    method=POST
+    case "$kind" in
+        api)
+            url=https://api.anthropic.com/v1/messages
+            header="x-api-key: $value"
+            extra=(-H 'anthropic-version: 2023-06-01' -H 'content-type: application/json')
+            data='{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' ;;
+        oauth|bearer)
+            url=https://api.anthropic.com/v1/messages
+            header="authorization: Bearer $value"
+            extra=(-H 'anthropic-version: 2023-06-01' -H 'content-type: application/json')
+            data='{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' ;;
+        grok)
+            url=https://api.x.ai/v1/api-key
+            header="authorization: Bearer $value"
+            extra=(); method=GET; data='' ;;
+        openai)
+            url=https://api.openai.com/v1/models
+            header="authorization: Bearer $value"
+            extra=(); method=GET; data='' ;;
+        gemini)
+            # Google takes the key in a header, and listing models is the
+            # cheapest authenticated call.
+            url=https://generativelanguage.googleapis.com/v1beta/models
+            header="x-goog-api-key: $value"
+            extra=(); method=GET; data='' ;;
+        *)
+            die "profile '$profile' declares kind '$kind', which this package does not know" ;;
+    esac
+
+    log "one live request to ${url#https://} as profile '$profile' (kind=$kind)"
+
+    # The credential goes in a curl config file, never on the command line, so it
+    # cannot appear in ps output.
+    if [[ -d /dev/shm && -w /dev/shm ]]; then
+        cfgdir="$(mktemp -d /dev/shm/ai-keys.XXXXXX)"
+    else
+        cfgdir="$(mktemp -d)"
+    fi
+    cfg="$cfgdir/curlrc"
+    ( umask 077; printf 'header = "%s"\n' "$header" > "$cfg" )
+    # shellcheck disable=SC2064  # $cfgdir must expand now: the trap must clean up
+    # this specific directory even if a later call reassigns the variable.
+    trap "rm -f '$cfgdir/curlrc'; rmdir '$cfgdir' 2>/dev/null || true" EXIT INT TERM
+
+    if [[ -n "$data" ]]; then
+        code="$(curl -sS -o /dev/null -w '%{http_code}' -X "$method" "$url" \
+            --config "$cfg" "${extra[@]+"${extra[@]}"}" -d "$data")" || die "request failed (network?)"
+    else
+        code="$(curl -sS -o /dev/null -w '%{http_code}' -X "$method" "$url" \
+            --config "$cfg")" || die "request failed (network?)"
+    fi
+
+    case "$code" in
+        200) log "HTTP 200: key works" ;;
+        401) die "HTTP 401: key rejected. Wrong key, revoked, or wrong kind for this header." ;;
+        403) die "HTTP 403: authenticated but not permitted (org policy, or an OAuth token used as an API key)." ;;
+        429) warn "HTTP 429: rate limited, but the credential authenticated." ;;
+        *)   warn "HTTP $code: inconclusive; see the Console for this key." ;;
+    esac
+    unset value
+}
+
+# ---- dispatch --------------------------------------------------------------
+cmd="${1:-}"; shift || true
+DIR_ARG=""
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--project) DIR_ARG="${2:?-p needs a directory}"; shift 2 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
+case "$cmd" in
+    init)  cmd_init ;;
+    add)   cmd_add "${1:-default}" ;;
+    list|ls) cmd_list ;;
+    which) cmd_which "${DIR_ARG:-$PWD}" ;;
+    link)  [[ $# -ge 1 ]] || die "usage: ai-keys link PROFILE [-p DIR]"
+           cmd_link "$1" "${DIR_ARG:-$PWD}" ;;
+    path)  cmd_path "${1:-}" ;;
+    rm|remove) [[ $# -ge 1 ]] || die "usage: ai-keys rm PROFILE"; cmd_rm "$1" ;;
+    check) cmd_check "${1:-}" ;;
+    test)  cmd_test "${1:-}" ;;
+    ""|-h|--help|help) usage ;;
+    *)     die "unknown command: $cmd (try --help)" ;;
+esac

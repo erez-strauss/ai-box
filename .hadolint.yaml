@@ -1,0 +1,10 @@
+# DL3008/DL3041: package versions are deliberately unpinned. Freshness is the
+# documented default (decision D8) and --no-updates plus --os-tag is the opt-out,
+# so pinning every package would contradict the design.
+# DL3013/DL3018: the same reasoning for pip and apk leaves.
+ignored:
+  - DL3008
+  - DL3041
+  - DL3013
+  - DL3018
+failure-threshold: error

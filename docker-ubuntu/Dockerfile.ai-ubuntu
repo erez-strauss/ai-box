@@ -1,0 +1,507 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+# Dockerfile.ai-ubuntu
+#
+# Ubuntu 26.04 LTS "Resolute Raccoon" + C++ build environment + Claude Code.
+#
+# 26.04 ships GCC 15.2 as the system compiler, GCC 16 alongside it in the
+# archive, and LLVM/Clang 21. That is recent enough that this image no longer
+# could take every compiler from Ubuntu's own signed archive. It does not by
+# default: policy D3a is newest *obtainable*, and the archive's Clang trails
+# Fedora's by a major version, so TOOLCHAIN=newest (the default) takes Clang
+# from apt.llvm.org. TOOLCHAIN=distro restricts the image to the Ubuntu archive,
+# which is one fewer third-party signing key and an older Clang.
+#
+# Compilers available inside:
+#   g++      -> the newest GCC installed (16 on 26.04); pin with GCC_DEFAULT=15
+#   g++-15, g++-16
+#   clang++  -> Clang 21
+#
+# Design goals:
+#   * Nothing from the host is visible except the one project directory you
+#     bind-mount at run time.
+#   * Runs as an unprivileged user whose UID/GID match yours, so files created
+#     in the bind mount are owned by you on the host.
+#   * No sudo, no package manager access at run time. If you need another
+#     library, add it here and rebuild. That is the point of the isolation.
+#   * No secrets baked into any layer. The API key / OAuth token is supplied
+#     at run time only (see docs/operating-guide.md).
+#
+# Build (context is the PACKAGE ROOT, not this directory -- shared/ is COPYed in):
+#   cd <package root>
+#   docker build -f docker-ubuntu/Dockerfile.ai-ubuntu \
+#       --build-arg UID=$(id -u) --build-arg GID=$(id -g) \
+#       -t ai-ubuntu:26.04 .
+#   or simply: scripts/build.sh ubuntu
+# ============================================================================
+
+# OS_TAG selects the base image tag; it can also be a digest
+# (e.g. --build-arg OS_TAG=26.04@sha256:...) for a byte-exact rebuild.
+ARG OS_TAG=26.04
+ARG BASE_IMAGE=ubuntu:${OS_TAG}
+FROM ${BASE_IMAGE}
+
+# ---- build-time knobs ------------------------------------------------------
+# Re-declared after FROM: ARGs used before FROM are otherwise out of scope
+# inside the build stage, and the LABELs below would expand to empty strings.
+ARG OS_TAG
+
+ARG UID=1000
+ARG GID=1000
+ARG USERNAME=dev
+
+# OS_UPDATES=1 (default) applies every pending distro update before installing
+# anything, so a fresh build gets current security fixes. OS_UPDATES=0 skips the
+# upgrade and takes the packages exactly as the base image tag shipped them,
+# which is what you want for a reproducible rebuild of an old image.
+ARG OS_UPDATES=1
+# Changing UPDATE_STAMP is what busts Docker's layer cache for the upgrade step.
+# Without it, a cached "apt-get dist-upgrade" layer would be reused forever and
+# the "updates by default" promise would quietly stop being true.
+ARG UPDATE_STAMP=static
+
+# GCC versions to install, and which one unversioned gcc/g++ point at.
+# GCC_DEFAULT=latest (the default since 1.7.0) resolves to the highest version
+# actually installed, so this does not need editing when the list changes. Pass
+# a number to pin it. Note that GCC 16 on 26.04 is a snapshot branch, not a
+# released 16.1: "latest" here means newest available, not most conservative.
+ARG GCC_VERSIONS="15 16"
+ARG GCC_DEFAULT=latest
+
+# Clang comes from the Ubuntu archive by default (21 on 26.04) via the
+# unversioned metapackages, so there is no version string to keep in sync.
+# LLVM_FROM_UPSTREAM=1 adds apt.llvm.org and installs LLVM_VERSION instead; that
+# path fails loudly if upstream has no packages for this codename yet.
+# TOOLCHAIN=newest (the default) takes the newest obtainable compilers, which on
+# Ubuntu means Clang from apt.llvm.org: the archive trails a major version behind
+# what Fedora ships, and this project's policy is newest obtainable rather than
+# newest packaged by the distribution.
+#
+# TOOLCHAIN=distro restricts the image to Ubuntu's own signed archive. That is one
+# fewer third-party signing key, at the cost of an older Clang. Choose it if your
+# supply-chain policy requires it.
+ARG TOOLCHAIN=newest
+ARG LLVM_FROM_UPSTREAM=
+ARG LLVM_VERSION=22
+
+# Claude Code apt channel: "stable" (~1 week behind, skips bad releases) or "latest".
+ARG CLAUDE_CHANNEL=stable
+# Pin to reproduce an exact image later, e.g. CLAUDE_VERSION=2.1.211.
+# Changing this value also busts the Docker layer cache for the install step,
+# which is exactly how scripts/upgrade.sh forces a new Claude Code in.
+ARG CLAUDE_VERSION=
+# Stamped into /etc/toolchain-versions for provenance.
+ARG PACKAGE_VERSION=dev
+# UTC by default; a maintainer's local zone is not a sensible image default.
+ARG TZ=UTC
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=${TZ}
+
+# ---- distro updates (default on) -------------------------------------------
+RUN set -eux; \
+    echo "update-stamp: ${UPDATE_STAMP}"; \
+    apt-get update; \
+    if [ "${OS_UPDATES}" = "1" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get -y \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            dist-upgrade; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- base OS + core dev tooling -------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget gnupg lsb-release \
+        build-essential make \
+        cmake ninja-build ccache mold \
+        autoconf automake libtool patch diffutils \
+        gdb valgrind strace ltrace \
+        git git-lfs openssh-client \
+        python3 python3-dev python3-pip python3-venv \
+        pkg-config file less nano vim-tiny tree jq bash-completion \
+        xz-utils zip unzip tar bzip2 procps psmisc time iputils-ping \
+        libssl-dev zlib1g-dev libcurl4-openssl-dev uuid-dev \
+        locales tzdata; \
+    rm -rf /var/lib/apt/lists/*
+
+# Optional extras, kept separate for the same reason as in the Fedora image: a
+# leaf package that gets renamed or dropped between releases should log a note,
+# not fail the whole build. apt has no --skip-unavailable, so install one by one.
+# ripgrep, fd-find and the libc++ set are here rather than above because they
+# are convenience leaves, and the same names are optional in the Fedora image.
+# linux-tools-common ships perf's wrapper but not the kernel-matched perf binary
+# (that lives in linux-tools-$(uname -r)), so perf is Fedora-only in practice.
+RUN set -eux; \
+    apt-get update; \
+    for p in ripgrep fd-find \
+             libc++-dev libc++abi-dev libomp-dev \
+             libboost-all-dev libfmt-dev catch2 libgtest-dev libgmock-dev \
+             libbenchmark-dev linux-tools-common \
+             musl-tools musl-dev libz-static \
+             cppcheck lcov gcovr iwyu elfutils libelf-dev shellcheck \
+             nlohmann-json3-dev libeigen3-dev doxygen graphviz \
+             binutils patchelf; do \
+        apt-get install -y --no-install-recommends "$p" \
+            || echo "optional package unavailable, skipped: $p"; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- GCC 15 and 16, both from the Ubuntu archive ---------------------------
+RUN set -eux; \
+    apt-get update; \
+    for v in ${GCC_VERSIONS}; do \
+        apt-get install -y --no-install-recommends "gcc-${v}" "g++-${v}"; \
+    done; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Clang / LLVM ----------------------------------------------------------
+# LLVM_FROM_UPSTREAM is derived from TOOLCHAIN unless it was set explicitly, so
+# `--build-arg TOOLCHAIN=distro` and `-L` both keep working.
+RUN set -eux; \
+    if [ -z "${LLVM_FROM_UPSTREAM}" ]; then \
+        [ "${TOOLCHAIN}" = newest ] && echo 1 > /tmp/llvm_upstream || echo 0 > /tmp/llvm_upstream; \
+    else \
+        echo "${LLVM_FROM_UPSTREAM}" > /tmp/llvm_upstream; \
+    fi; \
+    echo "TOOLCHAIN=${TOOLCHAIN}, LLVM from upstream: $(cat /tmp/llvm_upstream)"
+
+# ---- Clang / LLVM: distro archive ------------------------------------------
+# The unversioned metapackages always resolve to the release's LLVM, so nothing
+# here needs editing when Ubuntu moves to a newer one.
+RUN set -eux; \
+    if [ "$(cat /tmp/llvm_upstream)" = "0" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            clang clang-tools clang-tidy clang-format clangd \
+            lld lldb llvm llvm-dev; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# ---- Clang / LLVM: apt.llvm.org path (opt-in) ------------------------------
+RUN set -eux; \
+    if [ "$(cat /tmp/llvm_upstream)" = "1" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends software-properties-common; \
+        curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh; \
+        chmod +x /tmp/llvm.sh; \
+        if ! /tmp/llvm.sh "${LLVM_VERSION}" all; then \
+            echo "note: apt.llvm.org has no LLVM ${LLVM_VERSION} for this codename;" >&2; \
+            echo "      falling back to the Ubuntu archive Clang." >&2; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends \
+                clang clang-tools clang-tidy clang-format clangd \
+                lld lldb llvm llvm-dev libc++-dev libc++abi-dev libomp-dev; \
+            rm -rf /var/lib/apt/lists/*; \
+            exit 0; \
+        fi; \
+        apt-get install -y --no-install-recommends \
+            "libc++-${LLVM_VERSION}-dev" "libc++abi-${LLVM_VERSION}-dev" \
+            "libomp-${LLVM_VERSION}-dev" \
+            || apt-get install -y --no-install-recommends libc++-dev libc++abi-dev; \
+        for t in clang clang++ clangd clang-tidy clang-format lld lldb \
+                 llvm-cov llvm-profdata llvm-symbolizer scan-build; do \
+            if [ -x "/usr/bin/${t}-${LLVM_VERSION}" ]; then \
+                update-alternatives --install "/usr/bin/${t}" "${t}" \
+                    "/usr/bin/${t}-${LLVM_VERSION}" 200; \
+            fi; \
+        done; \
+        rm -f /tmp/llvm.sh; \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+RUN rm -f /tmp/llvm_upstream
+
+# ---- unversioned gcc/g++ -> GCC_DEFAULT ------------------------------------
+RUN set -eux; \
+    if [ "${GCC_DEFAULT}" = latest ]; then \
+        GCC_DEFAULT="$(for v in ${GCC_VERSIONS}; do \
+                           [ -x "/usr/bin/gcc-${v}" ] && echo "$v"; \
+                       done | sort -n | tail -1)"; \
+        [ -n "${GCC_DEFAULT}" ] || { echo "FATAL: no gcc from GCC_VERSIONS installed" >&2; exit 1; }; \
+        echo "GCC_DEFAULT=latest resolved to ${GCC_DEFAULT}"; \
+    fi; \
+    update-alternatives --install /usr/bin/gcc gcc "/usr/bin/gcc-${GCC_DEFAULT}" 100 \
+        --slave /usr/bin/g++ g++ "/usr/bin/g++-${GCC_DEFAULT}" \
+        --slave /usr/bin/gcov gcov "/usr/bin/gcov-${GCC_DEFAULT}"; \
+    gcc --version | head -1; \
+    clang --version | head -1; \
+    got="$(gcc -dumpversion | cut -d. -f1)"; \
+    if [ "$got" != "${GCC_DEFAULT}" ]; then \
+        echo "FATAL: gcc resolves to ${got}, expected ${GCC_DEFAULT}" >&2; \
+        update-alternatives --display gcc >&2 || true; \
+        exit 1; \
+    fi
+
+# ---- Python development environment ----------------------------------------
+# Ubuntu 26.04 ships Python 3.14 and enforces PEP 668, so `pip install` into the
+# system interpreter is refused. Rather than fight that with
+# --break-system-packages, the image provides a first-class virtualenv at
+# /opt/venv that is first on PATH ahead of /usr/bin and owned by the
+# unprivileged user, so `pip install` inside a session just works without root.
+# Anything installed there is ephemeral, which is what keeps the image
+# reproducible: a permanent addition belongs in PYTHON_TOOLS, not in a session.
+#
+# uv is included because it is the quickest route to a *different* Python than
+# the distro's: `uv venv --python 3.13` in a session, or UV_PYTHON at build time
+# to bake a standalone interpreter into the image.
+#
+# This layer sits after the compilers because it is cheaper and more volatile
+# than they are, and before the sanity check so the check covers it.
+ARG PYTHON_TOOLS="uv ruff mypy pytest pytest-cov ipython build wheel jinja2 numpy pandas"
+ARG UV_PYTHON=
+
+ENV VIRTUAL_ENV=/opt/venv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+# PYTHON_TOOLS is deliberately unquoted: it is a package list and must word-split.
+# hadolint ignore=SC2086
+RUN set -eux; \
+    python3 -m venv "${VIRTUAL_ENV}"; \
+    "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel; \
+    "${VIRTUAL_ENV}/bin/pip" install --no-cache-dir ${PYTHON_TOOLS}; \
+    if [ -n "${UV_PYTHON}" ]; then \
+        install -d "${UV_PYTHON_INSTALL_DIR}"; \
+        "${VIRTUAL_ENV}/bin/uv" python install "${UV_PYTHON}"; \
+    fi; \
+    "${VIRTUAL_ENV}/bin/python" --version; \
+    "${VIRTUAL_ENV}/bin/ruff" --version; \
+    "${VIRTUAL_ENV}/bin/python" -c 'import numpy, pandas, jinja2; \
+print("numpy", numpy.__version__, "pandas", pandas.__version__, "jinja2", jinja2.__version__)' 
+
+# ---- sanity check ----------------------------------------------------------
+# Fail during the build, not at first use, if a package installed but produced
+# no usable binary.
+RUN set -eux; \
+    for t in gcc g++ clang clang++ cmake ninja ccache git python3 gdb; do \
+        command -v "$t" >/dev/null || { echo "FATAL: $t missing after install" >&2; exit 1; }; \
+    done; \
+    for t in readelf objdump nm; do \
+        command -v "$t" >/dev/null \
+            || echo "note: $t missing (binutils did not install)" >&2; \
+    done; \
+    for t in python pip ruff mypy pytest uv; do \
+        [ -x "${VIRTUAL_ENV}/bin/$t" ] || { echo "FATAL: venv tool $t missing" >&2; exit 1; }; \
+    done; \
+    printf 'int main(){return 0;}\n' > /tmp/t.cpp; \
+    # Static linking must work, not merely be intended: the runtime archives
+    # (libc.a, libm.a, libstdc++.a) come from separate packages on rpm distros
+    # and their absence surfaces as "cannot find -lc" at a user's first -static.
+    printf '#include <string>\n#include <vector>\nint main(){std::string s="ok"; std::vector<int> v{1,2}; return (s.size()==2 && v.size()==2)?0:1;}\n' > /tmp/tstatic.cpp; \
+    g++ -std=c++17 -static /tmp/tstatic.cpp -o /tmp/tstatic; \
+    /tmp/tstatic; \
+    rm -f /tmp/tstatic.cpp /tmp/tstatic; \
+    g++ -std=c++23 /tmp/t.cpp -o /tmp/t.gcc; \
+    clang++ -std=c++23 /tmp/t.cpp -o /tmp/t.clang; \
+    for v in ${GCC_VERSIONS}; do \
+        "g++-${v}" -std=c++23 /tmp/t.cpp -o "/tmp/t.gcc${v}"; \
+    done; \
+    "${VIRTUAL_ENV}/bin/python" -c 'import sys; assert sys.version_info >= (3, 12), sys.version'; \
+    rm -f /tmp/t.cpp /tmp/t.gcc /tmp/t.clang /tmp/t.gcc[0-9]*
+
+# ---- Claude Code from the signed apt repository ----------------------------
+# Verifies the Anthropic release-signing fingerprint before trusting the key.
+# Package-manager installs do not auto-update, which is what you want in an
+# image: the toolchain and the agent are both pinned by the image tag.
+RUN set -eux; \
+    install -d -m 0755 /etc/apt/keyrings; \
+    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+        -o /etc/apt/keyrings/claude-code.asc; \
+    gpg --show-keys --with-colons /etc/apt/keyrings/claude-code.asc \
+        | grep -q '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'; \
+    echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/${CLAUDE_CHANNEL} ${CLAUDE_CHANNEL} main" \
+        > /etc/apt/sources.list.d/claude-code.list; \
+    apt-get update; \
+    if [ -n "${CLAUDE_VERSION}" ]; then \
+        apt-get install -y --no-install-recommends "claude-code=${CLAUDE_VERSION}*"; \
+    else \
+        apt-get install -y --no-install-recommends claude-code; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- optional third-party AI agents ----------------------------------------
+# Empty by default. See shared/install-agents.sh for what each agent is and how
+# it is distributed; only OpenAI's codex ships a native Linux binary, the others
+# are npm packages and need WITH_NODE=1.
+ARG AI_AGENTS=""
+ARG WITH_NODE=0
+ARG CODEX_VERSION=
+ARG CODEX_SHA256=
+ARG GEMINI_VERSION=latest
+ARG GROK_VERSION=latest
+
+COPY --chmod=0755 shared/install-agents.sh /usr/local/bin/install-agents.sh
+COPY --chmod=0755 shared/install-langs.sh  /usr/local/bin/install-langs.sh
+
+# Optional language toolchains. Empty by default: C++ and Python are the base
+# image. See shared/install-langs.sh for what each name installs per distro.
+ARG LANGS=""
+RUN AI_BOX_BUILD=1 /usr/local/bin/install-langs.sh "${LANGS}"
+
+# Node is installed by install-agents.sh when an npm-based agent is requested,
+# or unconditionally when WITH_NODE=1. It lives there rather than here so that a
+# build FROM a published base takes exactly the same path as this one.
+RUN set -eux; \
+    if [ "${WITH_NODE}" = "1" ]; then \
+        AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh --node-only; \
+    fi; \
+    CODEX_VERSION="${CODEX_VERSION}" CODEX_SHA256="${CODEX_SHA256}" \
+    GEMINI_VERSION="${GEMINI_VERSION}" \
+    GROK_VERSION="${GROK_VERSION}" \
+    AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh "${AI_AGENTS}"
+
+# ---- unprivileged user -----------------------------------------------------
+# The Ubuntu base image ships a stock "ubuntu" user at 1000:1000; remove it so
+# we can take that UID for the caller.
+RUN set -eux; \
+    if getent passwd ubuntu >/dev/null; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi; \
+    if ! getent group "${GID}" >/dev/null; then groupadd -g "${GID}" "${USERNAME}"; fi; \
+    useradd -m -u "${UID}" -g "${GID}" -s /bin/bash "${USERNAME}"; \
+    install -d -o "${UID}" -g "${GID}" -m 0755 /workspace \
+        "/home/${USERNAME}/.claude" \
+        "/home/${USERNAME}/.config" \
+        "/home/${USERNAME}/.claude/agents/codex" \
+        "/home/${USERNAME}/.claude/agents/gemini" \
+        "/home/${USERNAME}/.claude/agents/grok" \
+        /opt/toolchains; \
+    chown -R "${UID}:${GID}" "${VIRTUAL_ENV}"; \
+    if [ -d "${UV_PYTHON_INSTALL_DIR}" ]; then chown -R "${UID}:${GID}" "${UV_PYTHON_INSTALL_DIR}"; fi
+
+# The venv chown is not cosmetic and is not allowed to fail quietly: an
+# unwritable /opt/venv turns every in-session `pip install` into a permission
+# error, which is the exact failure the venv exists to prevent. The uv
+# directory only exists when UV_PYTHON was given, hence the test rather than a
+# swallowed error.
+
+# Deliberately NO sudo and NO passwordless root path.
+
+# ---- caches live in the workspace, not in the image or a side mount ---------
+# Every cache belongs to the project being worked on, so it lands in the bind-mounted
+# project directory and is deleted with it. That removes the ccache bind mount
+# entirely: the default run path is now the project directory and the Claude Code
+# state directory, and nothing else.
+#
+# Both the symlink and XDG_CACHE_HOME are set, deliberately. They catch different
+# misbehaviour: the variable covers tools that honour XDG but do not use ~/.cache
+# literally, and the symlink covers tools that expand ~/.cache themselves and ignore
+# XDG, which is common. Setting one and not the other leaves a gap.
+#
+# Per image, via CACHE_KEY. ccache is safe to share across distros because it keys on
+# a hash of the compiler binary, but pip is not: a wheel built from an sdist carries
+# the tag linux_x86_64 on both, so one compiled under Fedora's toolchain could be
+# reused under Ubuntu's. For an image whose purpose is C++ and Python together, that
+# is the failure to design out rather than hope about.
+#
+# This must come after every build step that writes to ~/.cache, because from here on
+# ~/.cache resolves into a directory that does not exist until a workspace is mounted.
+ARG CACHE_KEY=ubuntu
+RUN set -eux; \
+    rm -rf "/home/${USERNAME}/.cache"; \
+    ln -s "/workspace/.cache-${CACHE_KEY}" "/home/${USERNAME}/.cache"
+
+# ---- runtime environment ---------------------------------------------------
+ENV HOME=/home/${USERNAME} \
+    USER=${USERNAME} \
+    CCACHE_DIR=/workspace/.ccache-${CACHE_KEY} \
+    XDG_CACHE_HOME=/workspace/.cache-${CACHE_KEY} \
+    CCACHE_MAXSIZE=2G \
+    CMAKE_GENERATOR=Ninja \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    PATH=/usr/lib/ccache:/home/${USERNAME}/.local/bin:/opt/venv/bin:/opt/toolchains/bin:/usr/bin:/usr/local/bin:/bin \
+    TERM=xterm-256color \
+    GROK_HOME=/home/${USERNAME}/.claude/agents/grok \
+    GEMINI_CLI_HOME=/home/${USERNAME}/.claude/agents/gemini \
+    CODEX_HOME=/home/${USERNAME}/.claude/agents/codex \
+    DISABLE_AUTOUPDATER=1
+
+# fd is installed as fdfind on Debian/Ubuntu; tolerate its absence
+RUN if [ -x /usr/bin/fdfind ]; then ln -sf /usr/bin/fdfind /usr/local/bin/fd; fi
+
+# Create the destination directories explicitly, with an explicit mode.
+# BuildKit applies a COPY's --chmod to any parent directory it has to create
+# (moby/buildkit#5943), so `COPY --chmod=0644 x /usr/local/lib/ai-box/x`
+# leaves that directory mode 0644, with no execute bit and therefore not
+# traversable by an unprivileged user. Root ignores directory permissions, so
+# every build step still passed and the failure only appeared on the first
+# non-root run: "keyfile-lib.sh: Permission denied".
+RUN install -d -m 0755 /usr/local/lib/ai-box /usr/local/share/ai-box
+
+COPY --chmod=0755 shared/entrypoint.sh       /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 shared/toolchain-report.sh /usr/local/bin/toolchain-report.sh
+# The key-file parser the entrypoint sources. Shipping the same file the host
+# scripts source is what keeps the two ends from disagreeing about a profile.
+COPY --chmod=0644 shared/keyfile-lib.sh      /usr/local/lib/ai-box/keyfile-lib.sh
+COPY shared/settings.example.json            /usr/local/share/ai-box/settings.example.json
+
+# CCACHE_DISABLE, because /usr/lib/ccache is first on PATH and CCACHE_DIR now
+# points into /workspace: without it, `gcc --version` here goes through the
+# ccache shim, which initialises its cache directory and leaves root-owned files
+# in the directory a project is later mounted over.
+RUN AI_BOX_PACKAGE_VERSION="${PACKAGE_VERSION}" CCACHE_DISABLE=1 \
+    /usr/local/bin/toolchain-report.sh
+
+# /workspace is a mount point and must be empty in the image. Anything left here
+# is invisible at run time, because the bind mount hides it, so it can only bloat
+# the image and confuse a later step. Cleaned as root, while that is still
+# possible, and asserted rather than assumed.
+RUN set -eux; \
+    rm -rf /workspace/.cache-* /workspace/.ccache-*; \
+    if [ -n "$(ls -A /workspace)" ]; then \
+        echo "FATAL: /workspace is not empty in the image:" >&2; ls -lA /workspace >&2; exit 1; \
+    fi
+
+USER ${USERNAME}
+
+# Everything above ran as root, and root bypasses directory permission checks,
+# so no check above this line can see a path the real user cannot reach.
+# Read-only on purpose. It asserts reachability, which is the thing root cannot
+# check, and nothing else. Executing the entrypoint here would create cache
+# directories that this user may not be able to clean up again, which is exactly
+# how 1.6.3 broke the build. The entrypoint is exercised by smoke-test.sh
+# against a built image, where a failure costs a test run and not a build.
+RUN set -eux; \
+    for d in /usr/local/lib/ai-box /usr/local/share/ai-box; do \
+        test -x "$d" || { echo "FATAL: $d is not traversable: $(stat -c %a "$d")" >&2; exit 1; }; \
+    done; \
+    test -x /usr/local/bin/entrypoint.sh; \
+    test -r /usr/local/share/ai-box/settings.example.json; \
+    bash -c 'source /usr/local/lib/ai-box/keyfile-lib.sh; \
+             [ "$(aibox_key_var oauth)" = CLAUDE_CODE_OAUTH_TOKEN ]'; \
+    # Hard rule 2, asserted rather than assumed. A base image can start shipping
+    # sudo at any release; this makes that a failed build instead of a checker
+    # failure discovered later against a built artifact.
+    ! command -v sudo >/dev/null 2>&1 || { echo "FATAL: sudo present" >&2; exit 1; }; \
+    test -z "$(ls -A /workspace)"
+WORKDIR /workspace
+# Shell form, not JSON: the JSON form does no variable expansion, so a build
+# with --build-arg USERNAME=... used to declare volumes for a user that the
+# image does not have.
+# Only the Claude Code state directory. A VOLUME at ~/.cache/ccache would now be
+# declared through a symlink into the bind-mounted workspace, which creates an
+# anonymous volume that shadows the real target and silently discards the cache.
+VOLUME /home/${USERNAME}/.claude
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/bin/bash", "-l"]
+
+LABEL org.opencontainers.image.title="ai-ubuntu" \
+      org.opencontainers.image.description="Ubuntu 26.04 LTS + GCC 15/16 + Clang 21 + Claude Code, unprivileged, no host access" \
+      org.opencontainers.image.base.name="docker.io/library/ubuntu:26.04"
+
+# Recorded so `docker inspect` answers "was this built with updates applied?"
+# image.source is what links a published package to its repository on GHCR:
+# without it the package page has no README, licence or provenance.
+LABEL org.opencontainers.image.source="https://github.com/erez-strauss/ai-box" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${PACKAGE_VERSION}" \
+      com.ai-box.os-updates="${OS_UPDATES}" \
+      com.ai-box.os-tag="${OS_TAG}" \
+      com.ai-box.update-stamp="${UPDATE_STAMP}" \
+      com.ai-box.package-version="${PACKAGE_VERSION}"

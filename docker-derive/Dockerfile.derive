@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+# Dockerfile.derive
+#
+# Add agents, package updates and a matching UID to a PUBLISHED base image,
+# without rebuilding it.
+#
+# Why this exists. The published images carry no optional agents: a public image
+# containing four vendors' CLIs is a redistribution question, and most people
+# want one agent, not four. So the published artifact is the expensive part --
+# compilers, Python, analysis tools, forty minutes of build -- and this adds the
+# cheap part locally, in seconds.
+#
+# It is deliberately NOT a full image definition. It has no entrypoint, no user
+# creation, no cache layout: it inherits all of that from the base, which is the
+# point. `scripts/check-image-parity.sh` skips it for that reason.
+#
+# Used by: scripts/build.sh --pull
+# ============================================================================
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Everything here needs root; the base image ends as the unprivileged user.
+USER root
+
+ARG AI_AGENTS=""
+ARG LANGS=""
+ARG WITH_NODE=0
+ARG CODEX_VERSION=
+ARG CODEX_SHA256=
+ARG GEMINI_VERSION=latest
+ARG GROK_VERSION=latest
+ARG OS_UPDATES=1
+ARG UPDATE_STAMP=static
+ARG UID=1000
+ARG GID=1000
+ARG USERNAME=dev
+ARG PACKAGE_VERSION=dev
+
+# ---- package updates -------------------------------------------------------
+# A published image ages between releases. Refreshing here is usually what you
+# want and is far cheaper than a rebuild. UPDATE_STAMP busts the layer cache so
+# "updates by default" keeps meaning something, as in the base images.
+RUN set -eux; \
+    echo "update-stamp: ${UPDATE_STAMP}"; \
+    if [ "${OS_UPDATES}" = "1" ]; then \
+        if command -v dnf >/dev/null 2>&1; then \
+            dnf -y --setopt=install_weak_deps=False --nodocs upgrade; \
+            dnf clean all; rm -rf /var/cache/dnf; \
+        else \
+            export DEBIAN_FRONTEND=noninteractive; \
+            apt-get update; \
+            apt-get -y -o Dpkg::Options::=--force-confdef \
+                       -o Dpkg::Options::=--force-confold dist-upgrade; \
+            rm -rf /var/lib/apt/lists/*; \
+        fi; \
+    fi
+
+# ---- the requested agents --------------------------------------------------
+# The same script the base images use, so a derived image and a from-source
+# image install agents identically, Node included.
+RUN AI_BOX_BUILD=1 /usr/local/bin/install-langs.sh "${LANGS}"
+
+RUN set -eux; \
+    if [ "${WITH_NODE}" = "1" ]; then \
+        AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh --node-only; \
+    fi; \
+    CODEX_VERSION="${CODEX_VERSION}" CODEX_SHA256="${CODEX_SHA256}" \
+    GEMINI_VERSION="${GEMINI_VERSION}" \
+    GROK_VERSION="${GROK_VERSION}" \
+    AI_BOX_BUILD=1 /usr/local/bin/install-agents.sh "${AI_AGENTS}"
+
+# ---- match the caller's UID ------------------------------------------------
+# A published image is built with a fixed UID, and a user whose UID differs would
+# find every file the agent writes owned by someone else on the host. Remap here.
+# No-op in the common case where they already match.
+RUN set -eux; \
+    cur_uid="$(id -u "${USERNAME}")"; \
+    cur_gid="$(id -g "${USERNAME}")"; \
+    if [ "${cur_uid}" != "${UID}" ] || [ "${cur_gid}" != "${GID}" ]; then \
+        echo "remapping ${USERNAME} from ${cur_uid}:${cur_gid} to ${UID}:${GID}"; \
+        getent group "${GID}" >/dev/null || groupmod -g "${GID}" "${USERNAME}"; \
+        usermod  -u "${UID}" -g "${GID}" "${USERNAME}"; \
+        for d in "/home/${USERNAME}" /opt/venv /opt/toolchains /workspace; do \
+            [ -e "$d" ] && chown -R "${UID}:${GID}" "$d" || true; \
+        done; \
+    fi; \
+    test -z "$(ls -A /workspace)" || { echo "FATAL: /workspace not empty" >&2; exit 1; }
+
+# ---- refresh the report so it reflects what is now installed ---------------
+RUN AI_BOX_PACKAGE_VERSION="${PACKAGE_VERSION}" CCACHE_DISABLE=1 \
+    /usr/local/bin/toolchain-report.sh
+
+USER ${USERNAME}
+WORKDIR /workspace
+
+LABEL com.ai-box.derived-from="${BASE_IMAGE}" \
+      com.ai-box.agents="${AI_AGENTS}" \
+      com.ai-box.langs="${LANGS}" \
+      com.ai-box.package-version="${PACKAGE_VERSION}" \
+      com.ai-box.update-stamp="${UPDATE_STAMP}"

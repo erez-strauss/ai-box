@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push: {branches: [main]}
+  pull_request:
+  schedule:
+    # The weekly run is the point of this workflow. It is what catches a distro
+    # renaming a package, an upstream repository dropping a codename, or an agent
+    # vendor changing its install method, before a user does. All three have
+    # happened to this project.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions: {contents: read}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint, tests and self-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: bash -n
+        run: |
+          set -euo pipefail
+          for f in scripts/* shared/*.sh tests/*.sh; do
+            # scripts/* already includes ai-box and ai-keys, which carry no .sh
+            case "$f" in *.json|*.example|*.yaml) continue;; esac
+            bash -n "$f"
+          done
+      - name: shellcheck
+        run: shellcheck -x -S warning $(find scripts shared tests -name '*.sh') scripts/ai-box scripts/ai-keys
+      - name: unit tests
+        run: tests/run.sh
+      - name: image contract
+        run: scripts/check-image-parity.sh
+      - name: documentation links
+        run: scripts/check-doc-links.sh
+      - name: file inventory
+        run: scripts/check-file-inventory.sh --strict
+      - name: version stamps
+        run: scripts/stamp-version.sh --check
+      - name: no credentials committed
+        run: |
+          set -euo pipefail
+          # Every vendor prefix the key parser recognises. This listed only
+          # Anthropic and xAI, while `openai` and `gemini` kinds had been
+          # supported for several releases, so a committed sk-proj- or AIza key
+          # would have passed. Keep in step with aibox_key_kind_of_value.
+          pat='sk-ant-(api|oat)[0-9]{2}-[A-Za-z0-9_-]{20,}'
+          pat="$pat"'|xai-[A-Za-z0-9]{24,}'
+          pat="$pat"'|sk-(proj|svcacct)-[A-Za-z0-9_-]{20,}'
+          pat="$pat"'|AIza[A-Za-z0-9_-]{30,}'
+          if grep -rInE "$pat" . --exclude-dir=.git; then
+            echo "a credential-looking string is committed"; exit 1
+          fi
+      - name: build flags validate without an engine
+        run: |
+          set -euo pipefail
+          # Argument validation happens before the engine is touched, so a typo
+          # in --lang or --agents fails in seconds rather than after a build.
+          ! scripts/build.sh --lang bogus fedora 2>/dev/null
+          ! scripts/build.sh --agents bogus fedora 2>/dev/null
+          ! scripts/build.sh --toolchain silly fedora 2>/dev/null
+          scripts/ai-box --version >/dev/null
+          scripts/ai-box --help    >/dev/null
+
+      - name: changelog has an entry for VERSION
+        run: grep -q "^## $(cat VERSION) " CHANGELOG.md
+
+  package:
+    name: archive invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/pack.sh --stage "$RUNNER_TEMP/dist"
+      - name: exactly one top-level directory, named for the version
+        run: |
+          set -euo pipefail
+          v="$(cat VERSION)"
+          tops="$(tar tzf "$RUNNER_TEMP/dist/ai-box-v${v}.tar.gz" | cut -d/ -f1 | sort -u)"
+          [[ "$tops" == "ai-box-v${v}" ]] || { echo "unexpected: $tops"; exit 1; }
+      - name: the archive omits .github
+        run: |
+          ! tar tzf "$RUNNER_TEMP/dist/ai-box-v$(cat VERSION).tar.gz" | grep -q '\.github'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-box-tarball
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          retention-days: 14
+
+  images:
+    name: build ${{ matrix.image }}
+    # Image builds are slow and large. Run them on main, on demand, weekly, and on
+    # a pull request only when it is labelled, so documentation changes stay fast.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build-images')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [ubuntu, fedora, rocky]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h /
+      - run: scripts/build.sh ${{ matrix.image }}
+      - run: scripts/capabilities.sh
+      - run: scripts/verify-isolation.sh ${{ matrix.image }}
+      - run: scripts/smoke-test.sh ${{ matrix.image }}
+      - name: image size
+        run: docker images --filter=reference='ai-*' --format '{{.Repository}}:{{.Tag}} {{.Size}}'

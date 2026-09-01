@@ -1,0 +1,8 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+  # Base images are intentionally not tracked here: every build pulls a fresh
+  # base and applies OS updates by default, so a pinned-digest pull request would
+  # fight that design. See decision D8.
