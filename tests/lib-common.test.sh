@@ -93,4 +93,24 @@ is "--help exits 0 without an engine" "$hrc" '0'
 case "$out" in *"installed:"*) ok "--help says where the package is installed" ;;
               *) fail "--help says where the package is installed" "installed block" "$out" ;; esac
 
+
+# --tty must not be passed when there is no terminal. Passing it unconditionally
+# made every non-interactive use fail with "the input device is not a TTY": CI
+# jobs, cron, pipelines, and this package's own verify-isolation.sh.
+proj="$HOME/tty-proj"; mkdir -p "$proj"
+# --dry-run prints one argument per line, so match lines. A space-delimited
+# match passed the absence case by accident and failed the presence one, which
+# is a reminder that a green assertion is not the same as a correct one.
+argv="$("$HERE/../scripts/ai-box" -n -p "$proj" -a none -- true </dev/null 2>/dev/null || true)"
+if printf '%s\n' "$argv" | grep -qx -- '--tty'; then
+    fail "no --tty without a terminal" "--tty absent" "--tty present"
+else
+    ok "no --tty without a terminal"
+fi
+if printf '%s\n' "$argv" | grep -qx -- '--interactive'; then
+    ok "--interactive is kept regardless"
+else
+    fail "--interactive is kept regardless" "present" "absent"
+fi
+
 finish

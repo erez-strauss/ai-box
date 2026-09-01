@@ -4,6 +4,29 @@ All notable changes to ai-box. Versions follow semantic versioning:
 MAJOR for a change that breaks an existing workflow, MINOR for new capability,
 PATCH for fixes that change nothing about how you use it.
 
+## 2.3.8 - 2026-08-29
+
+### Fixed
+
+- **`ai-box` passed `--tty` unconditionally, so every non-interactive use failed** with
+  `the input device is not a TTY`. That covers CI jobs, cron entries, pipelines, and this
+  package's own `verify-isolation.sh`, which is where it surfaced: the Rocky isolation run
+  produced the TTY error, the probe returned nothing, and the check failed with no
+  explanation of why.
+
+  `--tty` is now added only when stdin and stdout are both terminals. `--interactive`
+  stays unconditionally, so a command can still be fed on stdin.
+
+  Same shape as the earlier root-versus-runner defect: it worked on a laptop and failed on
+  a runner, because the laptop had something the runner does not.
+
+- **The regression test for it was wrong on the first attempt**, and the way it was wrong
+  is worth recording. `--dry-run` prints one argument per line, and the assertion matched
+  against a space-delimited string, so the "no `--tty`" case passed by accident of absence
+  while the "`--interactive` kept" case failed. A green assertion is not the same as a
+  correct one. Both now match whole lines, and were checked in both directions: `--tty`
+  present under a real pty, absent without one.
+
 ## 2.3.7 - 2026-08-29
 
 ### Fixed

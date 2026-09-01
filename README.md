@@ -25,7 +25,7 @@ third-party key, an older Clang — and `-g VERSION` pins a specific GCC.
 [![CI](https://github.com/erez-strauss/ai-box/actions/workflows/ci.yml/badge.svg)](https://github.com/erez-strauss/ai-box/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Version:** 2.3.7 · **Host assumption:** Ubuntu 24.04 or newer + Docker Engine 28.x,
+**Version:** 2.3.8 · **Host assumption:** Ubuntu 24.04 or newer + Docker Engine 28.x,
 or Podman 5.x. Fedora and other SELinux hosts are handled; see Podman below.
 
 
@@ -53,8 +53,8 @@ the symlinks until you re-run `install.sh`.
 
 ```bash
 mkdir -p ~/src && cd ~/src          # a stable location, not ~/Downloads
-tar xzf ~/Downloads/ai-box-v2.3.7.tar.gz
-cd ai-box-v2.3.7
+tar xzf ~/Downloads/ai-box-v2.3.8.tar.gz
+cd ai-box-v2.3.8
 scripts/install.sh                  # links ai-box, ai-keys, ai-box-* into ~/.local/bin
 ```
 
@@ -65,8 +65,8 @@ Each release extracts into its own directory, so several versions can sit side b
 have each user run `install.sh` for themselves:
 
 ```bash
-sudo tar xzf ai-box-v2.3.7.tar.gz -C /opt      # /opt/ai-box-v2.3.7, root-owned, world-readable
-/opt/ai-box-v2.3.7/scripts/install.sh          # each user, once
+sudo tar xzf ai-box-v2.3.8.tar.gz -C /opt      # /opt/ai-box-v2.3.8, root-owned, world-readable
+/opt/ai-box-v2.3.8/scripts/install.sh          # each user, once
 ```
 
 That gives one copy of the package and per-user state, which is what you want: keys live in
@@ -713,7 +713,7 @@ of package members rather than "everything except", and verifies the finished ar
 really does have exactly one top-level entry. From a git checkout, where the directory is
 named after the repository, pass `--stage`.
 
-Releases are cut by tagging: `git tag v2.3.7 && git push origin v2.3.7`. The release
+Releases are cut by tagging: `git tag v2.3.8 && git push origin v2.3.8`. The release
 workflow refuses to publish if the tag, `VERSION` and `CHANGELOG.md` disagree, then
 attaches the tarball and `SHA256SUMS` with that version's changelog section as the notes.
 

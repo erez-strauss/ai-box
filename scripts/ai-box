@@ -237,8 +237,17 @@ fi
 Z="$(selinux_relabel_opt)"
 SECRET_RELABEL="$(secret_mount_relabel_opt)"
 
+# --tty only when there actually is one. Passing it unconditionally makes every
+# non-interactive use fail with "the input device is not a TTY": a CI job, a
+# cron entry, a pipeline, or this package's own verify-isolation.sh, which is
+# how it was found. --interactive stays, so a command can still be fed on stdin.
+TTY_ARGS=()
+if [[ -t 0 && -t 1 ]]; then
+    TTY_ARGS=(--tty)
+fi
+
 RUN_ARGS=(
-    --rm --interactive --tty --init
+    --rm --interactive --init
     --hostname "$(safe_hostname "$IMAGE_KEY")"
     --user "$(id -u):$(id -g)"
     --cap-drop=ALL
@@ -250,6 +259,7 @@ RUN_ARGS=(
     --volume "$STATE/claude:${CONFIG_DIR_IN_CONTAINER}${Z}"
     --env "CLAUDE_CONFIG_DIR=${CONFIG_DIR_IN_CONTAINER}"
     --tmpfs "/tmp:rw,nosuid,nodev,exec,size=4g"
+    "${TTY_ARGS[@]+"${TTY_ARGS[@]}"}"
     --env "TERM=${TERM:-xterm-256color}"
     --env "AI_BOX_PROJECT=$(basename "$PROJECT_DIR")"
     # Which image this is, so project conventions can key off it without the
