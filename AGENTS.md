@@ -42,7 +42,6 @@ is no other.
 | `docker-ubuntu/`, `docker-fedora/`, `docker-rocky/` | one Dockerfile each | distro-specific logic only |
 | `shared/` | files `COPY`ed into **every** image, plus config templates | anything duplicated between Dockerfiles belongs here instead |
 | `scripts/` | host-side bash | every script sources `lib-common.sh`; no logic duplicated across scripts |
-| `examples/` | C++ programs the smoke test compiles | must build with the image's own compilers, or be skipped by a documented feature probe |
 | `docs/` | operator documentation | versioned filenames (`*-v1.md`) |
 | `.github/` | workflows, issue templates, dependabot | repository infrastructure, never shipped in the release archive |
 
@@ -245,7 +244,7 @@ ai-keys add default           # store a credential, no browser
 scripts/check-updates.sh          # read-only: installed vs. channel candidate
 scripts/upgrade.sh                # rebuild with rollback tags
 for i in ubuntu fedora rocky; do scripts/verify-isolation.sh $i; scripts/smoke-test.sh $i; done
-scripts/smoke-test.sh ubuntu      # agent + compilers + python venv + examples/
+scripts/smoke-test.sh ubuntu      # agent + compilers + static linking + python venv
 scripts/doctor.sh                 # host-side setup; --fix repairs mechanical problems
 scripts/check-file-inventory.sh   # README file table matches the tree
 scripts/pack.sh                   # emit ai-box-v<VERSION>.tar.gz
@@ -296,7 +295,7 @@ Before reporting a change complete, all of these must hold:
 5. `scripts/smoke-test.sh ubuntu` and `... fedora` both pass. That covers
    `claude --version`, `/etc/toolchain-versions`, a C++23 compile-and-run with every
    compiler in the image, the `/opt/venv` Python tools (resolvable, runnable, writable
-   without root, `pytest` actually running a test), and the `examples/` reflection
+   without root, `pytest` actually running a test), and a generated reflection
    programs on any compiler that defines `__cpp_impl_reflection`. Never make a reflection
    check unconditional: it is GCC-only today, and the Ubuntu image must not start failing
    over it.

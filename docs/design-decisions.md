@@ -202,11 +202,10 @@ Roughly in the order it should be done.
    is exercised heavily; the images have not been built by every session that changed them.
    Until that happens, image-level claims are untested. Record the compiler versions that
    actually land, from `/etc/toolchain-versions`.
-2. **A project `CLAUDE.md` template and worked example projects.** `examples/` currently
-   holds compiler probes for the smoke test, which answer "does this toolchain work" rather
-   than "how do I work in the box". Agents inside the container will try to `sudo`, install
-   packages, write into `/opt/venv` and build in the source tree; a template saying where
-   things go is the highest-leverage documentation left.
+2. ~~**A project `CLAUDE.md` template**~~ **done**: `docs/project-template.md`. Worked
+   example projects are still open. The smoke test now generates its own sources, so a
+   future `examples/` would hold projects showing how to work in the box rather than
+   compiler probes, which is what the directory should have been.
 3. **Prove the optional agents on a built image.** Pinned versions, a fatal `--version`, a
    Codex checksum and a smoke-test branch that exercises whichever agents an image contains
    are all in place. What remains is running it against real images.

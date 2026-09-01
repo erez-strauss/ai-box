@@ -25,7 +25,7 @@ third-party key, an older Clang — and `-g VERSION` pins a specific GCC.
 [![CI](https://github.com/erez-strauss/ai-box/actions/workflows/ci.yml/badge.svg)](https://github.com/erez-strauss/ai-box/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Version:** 2.3.8 · **Host assumption:** Ubuntu 24.04 or newer + Docker Engine 28.x,
+**Version:** 2.3.9 · **Host assumption:** Ubuntu 24.04 or newer + Docker Engine 28.x,
 or Podman 5.x. Fedora and other SELinux hosts are handled; see Podman below.
 
 
@@ -53,8 +53,8 @@ the symlinks until you re-run `install.sh`.
 
 ```bash
 mkdir -p ~/src && cd ~/src          # a stable location, not ~/Downloads
-tar xzf ~/Downloads/ai-box-v2.3.8.tar.gz
-cd ai-box-v2.3.8
+tar xzf ~/Downloads/ai-box-v2.3.9.tar.gz
+cd ai-box-v2.3.9
 scripts/install.sh                  # links ai-box, ai-keys, ai-box-* into ~/.local/bin
 ```
 
@@ -65,8 +65,8 @@ Each release extracts into its own directory, so several versions can sit side b
 have each user run `install.sh` for themselves:
 
 ```bash
-sudo tar xzf ai-box-v2.3.8.tar.gz -C /opt      # /opt/ai-box-v2.3.8, root-owned, world-readable
-/opt/ai-box-v2.3.8/scripts/install.sh          # each user, once
+sudo tar xzf ai-box-v2.3.9.tar.gz -C /opt      # /opt/ai-box-v2.3.9, root-owned, world-readable
+/opt/ai-box-v2.3.9/scripts/install.sh          # each user, once
 ```
 
 That gives one copy of the package and per-user state, which is what you want: keys live in
@@ -297,11 +297,6 @@ infrastructure that only means anything on GitHub.
 | `tests/lib-common.test.sh` | Hostname derivation, image refs, state fallback, profile precedence, the credential guard, JSON validation. |
 | `tests/mount-guard.test.sh` | The mount guard, exercised through `ai-box -n` rather than by re-implementing its logic. Every case comes from a review that found the guard was an exact match, so `/etc` was refused while `/etc/ssh`, `/var/log` and `/root/.ssh` were not. |
 
-**`examples/`: C++ programs the smoke test compiles**
-
-| Path | What it is, and why it exists |
-|---|---|
-
 **`docs/`: operator documentation, versioned filenames**
 
 | Path | What it is, and why it exists |
@@ -328,27 +323,6 @@ infrastructure that only means anything on GitHub.
 | `.github/ISSUE_TEMPLATE/config.yml` | Routes suspected sandbox weaknesses to a private advisory, and Claude Code bugs upstream. |
 
 <!-- END FILE INVENTORY -->
-
-The build context for every Dockerfile is the **package root**, because both `COPY` from
-`shared/`. Build with `scripts/build.sh`, or by hand from this directory:
-
-```bash
-docker build -f docker-ubuntu/Dockerfile.ai-ubuntu \
-  --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t ai-ubuntu:26.04 .
-```
-
-`examples/` holds two C++26 static reflection (P2996) programs that `scripts/smoke-test.sh`
-builds and runs inside each image. Reflection is GCC-only today and needs `-freflection`;
-the smoke test probes for `__cpp_impl_reflection` and skips a compiler that does not have
-it rather than failing. See `examples/README.md`.
-
-Compilers in the Ubuntu image: `g++` is GCC 15.2, `g++-16` is there too for C++26 work,
-and `clang++` is Clang 21. All three come from Ubuntu's own signed archive, so there is no
-third-party compiler repository in the build. `scripts/build.sh -g 16` flips the
-unversioned `gcc`/`g++` to GCC 16; `scripts/build.sh -L -l 22 ubuntu` adds apt.llvm.org
-when you need an LLVM newer than the archive's.
-
----
 
 ## Commands
 
@@ -713,7 +687,7 @@ of package members rather than "everything except", and verifies the finished ar
 really does have exactly one top-level entry. From a git checkout, where the directory is
 named after the repository, pass `--stage`.
 
-Releases are cut by tagging: `git tag v2.3.8 && git push origin v2.3.8`. The release
+Releases are cut by tagging: `git tag v2.3.9 && git push origin v2.3.9`. The release
 workflow refuses to publish if the tag, `VERSION` and `CHANGELOG.md` disagree, then
 attaches the tarball and `SHA256SUMS` with that version's changelog section as the notes.
 

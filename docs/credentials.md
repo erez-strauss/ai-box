@@ -1,6 +1,6 @@
 # API keys without a browser
 
-**Applies to:** ai-box v2.3.8
+**Applies to:** ai-box v2.3.9
 
 **Companions:** `docs/operating-guide.md` §4 (the older, briefer treatment),
 `docs/upgrading.md`

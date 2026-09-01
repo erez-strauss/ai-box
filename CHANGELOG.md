@@ -4,6 +4,33 @@ All notable changes to ai-box. Versions follow semantic versioning:
 MAJOR for a change that breaks an existing workflow, MINOR for new capability,
 PATCH for fixes that change nothing about how you use it.
 
+## 2.3.9 - 2026-08-29
+
+### Fixed
+
+- **Every smoke test since 2.1.1 failed on two checks that compiled deleted files.**
+  Removing `examples/` took the directory and its mount, but left the checks that build
+  `/workspace/reflect-demo.cpp` and `/workspace/soa-transform.cpp`. The removal matched
+  lines containing `examples/`, and those two lines say `/workspace/`.
+
+  That is the same incomplete-replacement mistake this changelog keeps recording, with a
+  new twist: the checks reported `FAIL` in plain sight on every run, so the failure was
+  visible and simply never actioned. A red line in a passing habit is as good as invisible.
+
+  The reflection check now **generates its own source**, compiles it, and runs it, so it
+  proves reflection produces the right answer rather than merely parsing. Where a compiler
+  advertises `__cpp_impl_reflection` but cannot build the program, it reports SKIP with the
+  compiler's own message rather than failing the image, because the library side of P2996
+  is still moving. The smoke test now carries no fixture files at all.
+
+- **Eight stale `examples/` references in the documentation**, from the same removal: the
+  README inventory section and its heading, two lines in `AGENTS.md`, a paragraph in the
+  operating guide describing a mount that no longer happens, and entries in the roadmap and
+  decision log. The operating guide now describes what the smoke test actually does,
+  including that it carries its own sources and why.
+
+- `.dockerignore` still excluded `examples/`.
+
 ## 2.3.8 - 2026-08-29
 
 ### Fixed

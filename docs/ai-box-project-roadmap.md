@@ -29,8 +29,10 @@ cover the key parser and the shared library. There is nothing that tests `ai-box
 argument handling, `build.sh`'s flag resolution, or the entrypoint's cache logic, and each
 has produced a real defect. The images themselves are only tested by being built.
 
-**The second weakest is that examples do not match the audience.** `examples/` holds two
-C++26 reflection probes for the smoke test. Nothing shows a person how to work in the box.
+**The second weakest is that nothing shows a person how to work in the box.** The former
+`examples/` directory held compiler probes for the smoke test, which the smoke test now
+generates itself. `docs/project-template.md` covers the four things agents get wrong;
+worked example projects are still missing.
 
 ---
 
@@ -100,7 +102,7 @@ described as a mistake-catcher rather than a containment boundary.
 
 Already open work item 2, restated because it is the most user-visible: a project
 `CLAUDE.md` template and two worked example projects (`cpp-cmake`, `python-uv`), with
-`examples/` split into `image-checks/` and `projects/`.
+a new `examples/` holding projects rather than compiler probes.
 
 Agents in the box reliably try to `sudo`, install packages, write into `/opt/venv`, and
 build in the source tree. A template that says where things go prevents all four.

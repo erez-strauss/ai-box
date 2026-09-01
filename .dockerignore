@@ -1,6 +1,5 @@
 # The build context is the package root; keep it tiny.
 docs/
-examples/
 *.md
 *.tar.gz
 .git/

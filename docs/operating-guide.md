@@ -1,6 +1,6 @@
 # Running Claude Code in an isolated container
 
-**Package:** ai-box v2.3.8
+**Package:** ai-box v2.3.9
 
 **Host assumption:** Ubuntu 24.04 LTS or newer ("ubuntu 2.8" read as 24.04) with Docker
 Engine 28.x, or Podman 5.x on any host including Fedora and RHEL. The host release does
@@ -11,7 +11,7 @@ differences described in §0a.
 agent current), `CLAUDE.md` (rules for editing this package).
 
 All paths below are relative to the package root, i.e. the directory this archive
-extracted into (`ai-box-v2.3.8/`).
+extracted into (`ai-box-v2.3.9/`).
 
 The goal: Claude Code can read and write exactly one project directory and nothing
 else on your machine. No `~/.ssh`, no `~/.aws`, no browser profiles, no other repos,
@@ -143,7 +143,7 @@ That directory is fully writable, so keep it in git and push often.
                                  credentials, sessions, settings, backups)
         ccache/                  -> /home/dev/.cache/ccache
     ai-fedora_44/            same, kept separate on purpose
-~/src/ai-box-v2.3.8/     this package (Dockerfiles, scripts, docs)
+~/src/ai-box-v2.3.9/     this package (Dockerfiles, scripts, docs)
 ```
 
 State is keyed by image reference, so the Ubuntu and Fedora boxes never share a ccache,
@@ -156,7 +156,7 @@ scripts/install.sh
 ## 3. Build the images
 
 ```bash
-cd ~/src/ai-box-v2.3.8
+cd ~/src/ai-box-v2.3.9
 
 scripts/build.sh all            # all three images, with all pending OS updates
 scripts/build.sh ubuntu         # or one at a time
@@ -580,21 +580,19 @@ scripts/smoke-test.sh ubuntu
 scripts/smoke-test.sh fedora
 ```
 
-It mounts `examples/` read-only at `/workspace`, with the same hardening flags the
-wrapper uses, and checks that `claude` runs, that `/etc/toolchain-versions` is
-populated, and that every compiler in the image compiles **and runs** a C++23
-program. It then builds the two C++26 static reflection programs in `examples/`
-with any compiler that defines `__cpp_impl_reflection`.
+It runs each check in a throwaway container with the same hardening flags `ai-box`
+uses, writing every source it needs into the container's own `/tmp`. It compiles
+and runs a C++23 program with every compiler in the image, links a fully static
+binary and confirms with `file` that it really is static, checks that the
+`/opt/venv` tools resolve and that the venv is writable without root, and builds
+a generated C++26 reflection program on any compiler that advertises reflection,
+skipping it with the compiler's own message where the feature is absent or
+incomplete.
 
-Reflection (P2996) is GCC-only at the time of writing and needs `-freflection`.
-Measured on Fedora 44 with GCC 16.1.1: `__cpp_impl_reflection = 202603`,
-`__cpp_lib_reflection = 202603`, `__cpp_expansion_statements = 202506`. The same
-Fedora's Clang 22.1.8 rejects the programs outright, and the Ubuntu image's GCC
-16 is a snapshot branch that is not the default compiler. So the reflection
-checks report SKIP rather than FAIL when a compiler does not have the feature.
-`examples/README.md` covers the API and the three rules that are easy to trip
-over. Nothing in `examples/` is COPYed into an image; it is mounted at run time
-like any other project.
+It carries no fixture files. An earlier version mounted an `examples/` directory
+and compiled two programs from it; when that directory was removed the checks
+were left behind pointing at paths that no longer existed, and every smoke test
+failed on them until the references were found.
 
 The same script checks the Python environment: that `python` resolves to
 `/opt/venv/bin/python` rather than the system interpreter, that `sys.prefix`
