@@ -51,23 +51,18 @@ The full rules, style and definition of done are in [`AGENTS.md`](AGENTS.md), wh
 to human and AI contributors alike. The short version:
 
 ```bash
-shellcheck -x -S warning $(find scripts shared tests -name '*.sh') scripts/ai-box scripts/ai-keys
-tests/run.sh
-scripts/check-image-parity.sh
-scripts/check-doc-links.sh
-scripts/check-file-inventory.sh --strict
-scripts/stamp-version.sh --check
+scripts/ci-local.sh
 ```
 
-If you changed a Dockerfile, or a script that runs inside a container, also build and
-check:
+That runs exactly what CI runs, from the same definition: the workflow calls the same
+script. Run it as an ordinary user, never with `sudo` — CI runs unprivileged, and running
+as root hides failures. A test that creates a directory under `/home` passes as root and
+fails on a runner, which is how one shipped broken.
+
+If you changed a Dockerfile, or a script that runs inside a container, add the image half:
 
 ```bash
-scripts/build.sh -n all
-for i in ubuntu fedora rocky; do
-  scripts/verify-isolation.sh "$i"
-  scripts/smoke-test.sh "$i"
-done
+scripts/ci-local.sh --with-images     # about 35 minutes
 ```
 
 That second block matters more than it looks. Everything in the first block checks the

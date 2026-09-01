@@ -1,6 +1,6 @@
 # Running Claude Code in an isolated container
 
-**Package:** ai-box v2.3.4
+**Package:** ai-box v2.3.7
 
 **Host assumption:** Ubuntu 24.04 LTS or newer ("ubuntu 2.8" read as 24.04) with Docker
 Engine 28.x, or Podman 5.x on any host including Fedora and RHEL. The host release does
@@ -11,7 +11,7 @@ differences described in §0a.
 agent current), `CLAUDE.md` (rules for editing this package).
 
 All paths below are relative to the package root, i.e. the directory this archive
-extracted into (`ai-box-v2.3.4/`).
+extracted into (`ai-box-v2.3.7/`).
 
 The goal: Claude Code can read and write exactly one project directory and nothing
 else on your machine. No `~/.ssh`, no `~/.aws`, no browser profiles, no other repos,
@@ -143,7 +143,7 @@ That directory is fully writable, so keep it in git and push often.
                                  credentials, sessions, settings, backups)
         ccache/                  -> /home/dev/.cache/ccache
     ai-fedora_44/            same, kept separate on purpose
-~/src/ai-box-v2.3.4/     this package (Dockerfiles, scripts, docs)
+~/src/ai-box-v2.3.7/     this package (Dockerfiles, scripts, docs)
 ```
 
 State is keyed by image reference, so the Ubuntu and Fedora boxes never share a ccache,
@@ -156,7 +156,7 @@ scripts/install.sh
 ## 3. Build the images
 
 ```bash
-cd ~/src/ai-box-v2.3.4
+cd ~/src/ai-box-v2.3.7
 
 scripts/build.sh all            # all three images, with all pending OS updates
 scripts/build.sh ubuntu         # or one at a time

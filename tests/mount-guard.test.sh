@@ -13,21 +13,34 @@ STUB="$(mktemp -d)"; printf '#!/bin/sh\ncase "$1" in image) exit 0;; volume) exi
 chmod +x "$STUB/docker"; PATH="$STUB:$PATH"; export PATH
 trap 'rm -rf "$HOME" "$STUB"' EXIT
 
+# A refusal must come from the guard, not from the directory being absent.
+#
+# The first version of these helpers treated any non-zero exit as a pass, so a
+# case naming a path that does not exist passed for the wrong reason, and the
+# one case expecting success failed on a CI runner where an unprivileged user
+# cannot create a directory under /home. Match the message instead.
 refuses() {  # refuses <label> <dir>
-    mkdir -p "$2" 2>/dev/null || true
-    if "$HERE/../scripts/ai-box" -n -p "$2" -a none -- true >/dev/null 2>&1; then
-        fail "$1" "refused" "allowed"
-    else
-        ok "$1"
-    fi
+    local out
+    # No mkdir. The guard judges the path before checking that it exists, so a
+    # refusal does not depend on the test being able to create anything -- which
+    # it could not for /opt/foo or /root on an unprivileged runner.
+    out="$("$HERE/../scripts/ai-box" -n -p "$2" -a none -- true 2>&1 >/dev/null || true)"
+    case "$out" in
+        *"refusing to mount"*)  ok "$1" ;;
+        *"no such directory"*)  fail "$1" "refused by the guard" "the directory does not exist, so the guard was never reached" ;;
+        '')                     fail "$1" "refused by the guard" "allowed" ;;
+        *)                      fail "$1" "refused by the guard" "$out" ;;
+    esac
 }
-allows() {
-    mkdir -p "$2" 2>/dev/null || true
-    if "$HERE/../scripts/ai-box" -n -p "$2" -a none -- true >/dev/null 2>&1; then
-        ok "$1"
-    else
-        fail "$1" "allowed" "refused"
+
+allows() {   # allows <label> <dir>
+    local out
+    if ! mkdir -p "$2" 2>/dev/null; then
+        fail "$1" "a usable directory" "could not create $2 in this environment"
+        return
     fi
+    out="$("$HERE/../scripts/ai-box" -n -p "$2" -a none -- true 2>&1 >/dev/null || true)"
+    if [[ -z "$out" ]]; then ok "$1"; else fail "$1" "allowed" "$out"; fi
 }
 
 for d in /etc /var /root /usr /opt /boot /proc /sys /dev /srv /mnt /media; do
@@ -39,7 +52,10 @@ done
 refuses "the whole temp directory" /tmp
 refuses "the whole var temp"       /var/tmp
 # The whole point: prefix, not exact.
-for d in /etc/ssh /var/log /usr/local/src /opt/foo; do
+# None of these need to exist, which is the point: the guard is about the path,
+# not about the filesystem. /opt/foo and /root/.ssh are unreachable for an
+# unprivileged user and are checked anyway.
+for d in /etc/ssh /var/log /usr/local/src /opt/foo /root/.ssh /boot/efi; do
     refuses "beneath a system tree: $d" "$d"
 done
 allows "a scratch project under /tmp" "/tmp/ai-box-scratch-test"
@@ -60,5 +76,11 @@ refuses "the key store through its symlink target" "$real"
 rm -rf "$AI_KEYS_DIR"; mkdir -p "$AI_KEYS_DIR"
 
 allows "an ordinary project"            "$HOME/src/proj"
-allows "another user home"              "/home/someone-else-proj"
+
+# The guard refuses /home itself and $HOME itself, both exactly, because projects
+# live under them. A sibling home must still be allowed. Rooted in the temp tree
+# rather than the real /home: an unprivileged CI runner cannot create a directory
+# there, and the assertion is about the guard, not about filesystem permissions.
+mkdir -p "$HOME/../home-of-someone-else/proj"
+allows "a sibling user's project"       "$HOME/../home-of-someone-else/proj"
 finish

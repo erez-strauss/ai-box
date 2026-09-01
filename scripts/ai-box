@@ -119,7 +119,12 @@ else
     image_exists "$IMAGE" || die "image $IMAGE not built; run scripts/build.sh ${IMAGE_KEY}"
 fi
 
-PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" || die "no such directory"
+# Canonicalise WITHOUT requiring the path to exist, so the mount guard judges
+# what was asked for rather than what happens to be present. Running the
+# existence check first meant `-p /etc/ssh` on a machine without openssh said
+# "no such directory", which is the wrong refusal: the answer is the same either
+# way, and a user typing a system path deserves to be told that is why.
+PROJECT_DIR="$(readlink -m "$PROJECT_DIR")"
 
 # ---- mount guard ------------------------------------------------------------
 # One project directory, never a tree of them and never a directory whose whole
@@ -176,6 +181,11 @@ unset _sensitive
 # .ai-profile is meant to be committed, so a credential in it is already a
 # leak. Checked here, in the parent shell, and not inside resolve_key_profile:
 # that one runs in a command substitution where die() kills only the subshell.
+# The guard has had its say, so a surviving path must actually exist. Checking
+# after rather than before means a system path is refused as a system path,
+# whether or not it happens to be present on this machine.
+[[ -d "$PROJECT_DIR" ]] || die "no such directory: $PROJECT_DIR"
+
 assert_profile_file_sane "$PROJECT_DIR"
 
 STATE="$(state_dir "$IMAGE")"

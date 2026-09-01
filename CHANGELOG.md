@@ -4,6 +4,94 @@ All notable changes to ai-box. Versions follow semantic versioning:
 MAJOR for a change that breaks an existing workflow, MINOR for new capability,
 PATCH for fixes that change nothing about how you use it.
 
+## 2.3.7 - 2026-08-29
+
+### Fixed
+
+- **The mount guard now judges the path before checking that it exists.** `ai-box` resolved
+  the project directory with `cd … && pwd -P` first, so `-p /opt/foo` or `-p /etc/ssh` on a
+  machine where those are absent produced `no such directory` rather than
+  `refusing to mount … that is a system directory`. The refusal was right; the reason was
+  wrong, and a user typing a system path deserves to be told that is why.
+
+  The path is now canonicalised with `readlink -m`, which does not require existence, the
+  guard runs, and only then is the directory required to exist. A harmless path that is
+  missing still says `no such directory`.
+
+- **`tests/mount-guard.test.sh` no longer depends on what the filesystem contains.** The
+  case `beneath a system tree: /opt/foo` failed on a host where `/opt/foo` does not exist
+  and an unprivileged user cannot create it: the stricter helper added in 2.3.5 correctly
+  reported that the guard had never been reached. With the ordering fixed, the tests create
+  nothing at all, `/root` no longer needs skipping, and `/root/.ssh` and `/boot/efi` are
+  checked too. 37 assertions, identical as root and as an unprivileged user, with both run.
+
+- **`ci-local.sh` borrows shellcheck from an image when the host lacks it.** Reporting a
+  hard failure told a contributor to install a tool that every ai-box image already ships.
+  It now runs the check inside the default image when one is built, says so, and only fails
+  outright when neither a host binary nor an image is available.
+
+  The comment explaining this could not begin with the tool's name: a comment line starting
+  with `shellcheck` is parsed as a directive by shellcheck itself, which failed the very
+  check being described.
+
+## 2.3.6 - 2026-08-29
+
+### Added
+
+- **`scripts/ci-local.sh`**, and the CI workflow now calls it instead of repeating the
+  commands. This removes a duplication that was already drifting: the checks lived only in
+  `.github/workflows/ci.yml`, which is not in the released archive, so "run what CI runs"
+  meant transcribing YAML by hand. The `checks` and `package` jobs are now one line each.
+
+      scripts/ci-local.sh                 lint, tests, gates, archive invariants
+      scripts/ci-local.sh --with-images   also builds and checks all three images
+      scripts/ci-local.sh --pack-to DIR   keep the archive, which is how CI gets its artifact
+
+- **It warns when run as root**, because CI runs unprivileged and root hides real failures.
+  That is not hypothetical: a mount-guard case that creates a directory under `/home`
+  passed as root and failed on a runner, and it shipped that way. The warning names the
+  reason rather than just the fact.
+
+- **It says what it did not do.** Without `--with-images` it ends by pointing at the image
+  half, which is the part source checks structurally cannot cover and the part that has
+  been skipped often enough to matter.
+
+- When `shellcheck` is missing it says so, fails, and mentions that every ai-box image
+  ships it, so `ai-box -- shellcheck …` works without installing anything on the host.
+
+### Changed
+
+- `CONTRIBUTING.md`'s pre-pull-request block is now one command instead of six, with the
+  reason for running it unprivileged.
+- `AGENTS.md` keeps the numbered definition of done, because it explains why each item
+  exists, and now says which script actually runs them and that CI calls the same script so
+  the two cannot drift.
+
+## 2.3.5 - 2026-08-29
+
+### Fixed
+
+- **`tests/mount-guard.test.sh` failed on a CI runner**, on the one case that expects a
+  directory to be *allowed*. The test created `/home/someone-else-proj` to check that a
+  sibling user's home is not refused; an unprivileged runner cannot create a directory
+  under `/home`, so `ai-box` refused with `no such directory` and the assertion read that
+  as the guard rejecting it. The guard was correct throughout; the test assumed it was
+  running as root.
+
+- **And the same assumption was hiding false passes.** The helpers treated *any* non-zero
+  exit as a refusal, so every case naming a path the test could not reach passed for the
+  wrong reason. `/root` was one: an unprivileged user cannot enter it, so `ai-box` never
+  consulted the guard and the case passed regardless of what the guard did.
+
+  Both helpers now match the message. A refusal counts only when `ai-box` says
+  `refusing to mount`; `no such directory` is reported as a broken test case rather than a
+  pass, and a directory that cannot be created is reported as an environment problem rather
+  than a guard failure. `/root` is skipped with a stated reason when it is not readable,
+  and the sibling-home case is rooted in the test's own temporary tree, where it can be
+  created at any privilege level.
+
+  The suite now passes as root and as an unprivileged user, and both were run.
+
 ## 2.3.4 - 2026-08-29
 
 ### Fixed

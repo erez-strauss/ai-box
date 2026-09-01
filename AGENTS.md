@@ -273,6 +273,11 @@ only `smoke-test.sh` can, and only on a host.
 
 ## Definition of done
 
+`scripts/ci-local.sh` runs items 1 to 3 and 7 to 11 below, and
+`scripts/ci-local.sh --with-images` adds 4 to 6. The list is kept here because it explains
+*why* each item exists; the script is what actually runs them, and CI calls the same
+script so the two cannot drift.
+
 Before reporting a change complete, all of these must hold:
 
 1. `bash -n` passes on every file in `scripts/` and `shared/*.sh`.
