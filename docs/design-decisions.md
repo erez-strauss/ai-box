@@ -80,6 +80,13 @@ distribution's own signed repositories. That is one fewer third-party signing ke
 build, at the cost of an older Clang. Some supply-chain policies require it; the default
 does not assume yours does. `-g 15` similarly pins a specific GCC.
 
+**Reflection is GCC-only in these images, and that is upstream's state, not a packaging
+gap.** GCC 16 carries P2996 because the feature branch merged into trunk; upstream Clang is
+implementing it incrementally, so Fedora's Clang 22 accepts some of the syntax while
+`__cpp_impl_reflection` is still undefined. The complete Clang implementation is Bloomberg's
+`clang-p2996` fork, which no distribution ships. `smoke-test.sh` reports which of those
+states a compiler is in rather than a flat "not supported".
+
 **Newest is not the same as most conservative, and there is now evidence.** A build of all
 three images produced GCC 16.0.1 (a March snapshot) on Ubuntu and GCC 16.2.1 (a release) on
 Fedora. A C++26 reflection program that compiles on Fedora failed on Ubuntu with

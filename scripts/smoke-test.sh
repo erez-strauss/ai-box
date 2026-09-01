@@ -78,15 +78,27 @@ for cc in g++ clang++ g++-15 g++-16; do
 done
 
 # --- C++26 reflection, where the compiler claims to have it ---------------
+# `SKIP (not supported)` conflated three different states, and the interesting
+# one is the middle: upstream Clang is implementing P2996 incrementally, so it
+# accepts the syntax while the feature-test macro is still undefined. Say which
+# state a compiler is in, so "not supported" is never mistaken for "broken".
 printf "%s\n" "#if !defined(__cpp_impl_reflection)" "#error no reflection" "#endif" \
     "int main() { return 0; }" > /tmp/probe.cpp
+printf "%s\n" "#if !__has_feature(reflection)" "#error no feature" "#endif" \
+    "int main() { return 0; }" > /tmp/feat.cpp
 for cc in g++ g++-16 clang++; do
     command -v "$cc" >/dev/null 2>&1 || continue
     flags="-std=c++26 -freflection"
     if ! "$cc" $flags -fsyntax-only /tmp/probe.cpp >/dev/null 2>&1; then
         flags="-std=c++26"
         if ! "$cc" $flags -fsyntax-only /tmp/probe.cpp >/dev/null 2>&1; then
-            chk "c++26 reflection: $cc" "SKIP (not supported)"
+            if "$cc" -std=c++26 -freflection -fsyntax-only /tmp/feat.cpp >/dev/null 2>&1; then
+                chk "c++26 reflection: $cc" "SKIP (partial: __has_feature(reflection) but no __cpp_impl_reflection)"
+            elif "$cc" -std=c++26 -freflection -fsyntax-only /dev/null >/dev/null 2>&1; then
+                chk "c++26 reflection: $cc" "SKIP (-freflection accepted, macro undefined: implementation in progress)"
+            else
+                chk "c++26 reflection: $cc" "SKIP (no reflection support in this compiler)"
+            fi
             continue
         fi
     fi

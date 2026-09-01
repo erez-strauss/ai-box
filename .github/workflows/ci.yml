@@ -21,7 +21,7 @@ jobs:
     name: lint, tests and self-checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: run the same checks the package ships
         # Deliberately one line. These commands used to be copied into this file,
@@ -33,12 +33,12 @@ jobs:
     name: archive invariants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: checks plus a retained archive
         run: scripts/ci-local.sh --pack-to "$RUNNER_TEMP/dist"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ai-box-tarball
           path: ${{ runner.temp }}/dist/*.tar.gz
@@ -58,7 +58,7 @@ jobs:
       matrix:
         image: [ubuntu, fedora, rocky]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true

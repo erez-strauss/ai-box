@@ -4,6 +4,44 @@ All notable changes to ai-box. Versions follow semantic versioning:
 MAJOR for a change that breaks an existing workflow, MINOR for new capability,
 PATCH for fixes that change nothing about how you use it.
 
+## 2.3.10 - 2026-08-29
+
+### Changed: GitHub Actions
+
+- **`actions/checkout` and `actions/upload-artifact` moved from v4 to v7.** GitHub warns
+  that v4 runs on Node 20, which is deprecated; v7 runs on Node 24. Confirmed at the
+  source rather than from the tag number: `action.yml` on the v4 branch declares
+  `using: node20` and on v7 declares `using: node24`. Six references across the three
+  workflows.
+
+  Both are first-party GitHub actions, so hard rule 18 -- no third-party action in the
+  pipeline that builds this package -- is not in play. After this change the workflows use
+  no third-party actions at all.
+
+  `dependabot.yml` already tracks `github-actions` weekly, so this will not need doing by
+  hand again once the repository is live. It needed doing by hand this time because the
+  repository is not published yet, which is worth remembering for the other things
+  Dependabot would otherwise have caught.
+
+### Changed: the reflection probe says which kind of "not supported"
+
+`SKIP (not supported)` conflated three distinct states, and the interesting one is the
+middle. Upstream Clang is implementing P2996 incrementally -- the operator's parsing landed
+in late 2025 and the `std::meta` library side is still open -- so a Clang can accept the
+syntax while `__cpp_impl_reflection` remains undefined. Reporting that as "not supported"
+invites the reading that something is broken.
+
+The probe now distinguishes:
+
+- `SKIP (no reflection support in this compiler)`
+- `SKIP (-freflection accepted, macro undefined: implementation in progress)`
+- `SKIP (partial: __has_feature(reflection) but no __cpp_impl_reflection)`
+
+Which explains the Fedora image exactly: GCC 16 has reflection because the feature branch
+merged into GCC trunk, while Clang 22 is upstream LLVM, where the work is still in
+progress. The complete Clang implementation is Bloomberg's `clang-p2996` fork, which is not
+what a distribution ships. **Use `g++` for reflection work in these images.**
+
 ## 2.3.9 - 2026-08-29
 
 ### Fixed

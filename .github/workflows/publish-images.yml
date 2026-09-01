@@ -28,7 +28,7 @@ jobs:
           - {image: fedora, repo: ai-fedora, dockerfile: docker-fedora/Dockerfile.ai-fedora44}
           - {image: rocky,  repo: ai-rocky,  dockerfile: docker-rocky/Dockerfile.ai-rocky10}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "$AGENT_TOOLSDIRECTORY" || true

@@ -1,6 +1,6 @@
 # Upgrading Claude Code inside the images
 
-**Applies to:** ai-box v2.3.9
+**Applies to:** ai-box v2.3.10
 
 
 ## The model in one paragraph
@@ -21,7 +21,7 @@ end - it is supported, with tradeoffs.
 ## Routine upgrade
 
 ```bash
-cd ~/src/ai-box-v2.3.9
+cd ~/src/ai-box-v2.3.10
 
 scripts/check-updates.sh          # what is installed vs. what the channel offers
 scripts/upgrade.sh                # rebuild all three images
@@ -151,7 +151,7 @@ Description=Check for a newer Claude Code in the ai-box images
 
 [Service]
 Type=oneshot
-ExecStart=%h/src/ai-box-v2.3.9/scripts/check-updates.sh
+ExecStart=%h/src/ai-box-v2.3.10/scripts/check-updates.sh
 StandardOutput=journal
 ```
 
